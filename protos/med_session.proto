@@ -1,0 +1,105 @@
+// med_session.proto
+//
+// Cross-language serialization schema for med-langchain-memory.
+// This file is the single source of truth for every downstream service
+// (any language) that reads or writes medical chat sessions.
+//
+// Storage rules (see docs/storage-spec.md):
+//   - All persisted payloads MUST be protobuf binary. JSON is forbidden
+//     at the storage layer (API DTOs excluded).
+//   - Field numbers are frozen once released; never reuse or renumber.
+//
+// Compile: python scripts/gen_proto.py
+
+syntax = "proto3";
+
+package med.session.v1;
+
+option java_package = "com.medlangchain.memory.proto.v1";
+option java_multiple_files = true;
+option go_package = "github.com/xxinjie21/med-langchain-memory/gen/go/medsessionv1";
+
+// Role of the message sender. Values are aligned with the Python
+// domain enum MessageRole (patient / doctor / assistant / system).
+enum MessageRole {
+  // Unknown / unset. Required proto3 zero value; never persist it.
+  MESSAGE_ROLE_UNSPECIFIED = 0;
+  MESSAGE_ROLE_PATIENT = 1;
+  MESSAGE_ROLE_DOCTOR = 2;
+  MESSAGE_ROLE_ASSISTANT = 3;
+  MESSAGE_ROLE_SYSTEM = 4;
+}
+
+// Lifecycle status of a consultation session. Aligned with the Python
+// domain enum SessionStatus and its state machine:
+//   ACTIVE -> CLOSED | ARCHIVED
+//   CLOSED -> ACTIVE | ARCHIVED
+//   ARCHIVED -> DELETED
+//   DELETED is terminal.
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_STATUS_ACTIVE = 1;
+  SESSION_STATUS_CLOSED = 2;
+  SESSION_STATUS_ARCHIVED = 3;
+  SESSION_STATUS_DELETED = 4;
+}
+
+// A single message inside a doctor-patient consultation session.
+message MedMessage {
+  // UUIDv7 string, time-ordered (RFC 9562).
+  string message_id = 1;
+  // Session this message belongs to.
+  string session_id = 2;
+  // Hospital / organization tenant id.
+  string tenant_id = 3;
+  // Department id inside the tenant.
+  string dept_id = 4;
+  // Patient id (stored masked when privacy rules apply).
+  string patient_id = 5;
+  // Sender role.
+  MessageRole role = 6;
+  // Message body. May be field-level masked before persisting.
+  string content = 7;
+  // Token count of content (0 when not computed).
+  int32 token_count = 8;
+  // Whether content has been masked by the privacy engine.
+  bool masked = 9;
+  // Creation time, epoch milliseconds UTC.
+  int64 created_at = 10;
+  // Extension labels (small, string-only).
+  map<string, string> metadata = 11;
+}
+
+// Metadata of one consultation session.
+message SessionMeta {
+  string session_id = 1;
+  string tenant_id = 2;
+  string dept_id = 3;
+  string patient_id = 4;
+  SessionStatus status = 5;
+  // Number of messages persisted in this session.
+  int32 message_count = 6;
+  // Creation time, epoch milliseconds UTC.
+  int64 created_at = 7;
+  // Last update time, epoch milliseconds UTC.
+  int64 updated_at = 8;
+  map<string, string> metadata = 9;
+}
+
+// Ordered batch of messages for one session. Used by bulk writes,
+// cross-store migration and archive payloads.
+message MedMessageBatch {
+  string session_id = 1;
+  repeated MedMessage messages = 2;
+}
+
+// Full session snapshot: meta + all messages. Used by snapshot
+// export/import (lifecycle/snapshot.py) with an external checksum.
+message SessionSnapshot {
+  SessionMeta meta = 1;
+  repeated MedMessage messages = 2;
+  // Snapshot creation time, epoch milliseconds UTC.
+  int64 snapshot_at = 3;
+  // Schema version of this snapshot payload, e.g. "1".
+  string schema_version = 4;
+}
