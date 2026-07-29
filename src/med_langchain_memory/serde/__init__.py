@@ -3,3 +3,10 @@
 ``med_session_pb2`` 由 ``scripts/gen_proto.py`` 从
 ``protos/med_session.proto`` 编译生成并提交入库，请勿手工修改。
 """
+
+from __future__ import annotations
+
+from med_langchain_memory.serde.base import SerializationError, Serializer
+from med_langchain_memory.serde.protobuf_serializer import ProtobufSerializer
+
+__all__ = ["Serializer", "SerializationError", "ProtobufSerializer"]
