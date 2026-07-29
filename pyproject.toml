@@ -52,6 +52,10 @@ packages = ["src/med_langchain_memory"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+exclude = [
+    "src/med_langchain_memory/serde/med_session_pb2.py",
+    "src/med_langchain_memory/serde/med_session_pb2.pyi",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
@@ -62,6 +66,11 @@ python_version = "3.11"
 strict = true
 mypy_path = "src"
 packages = ["med_langchain_memory"]
+
+[[tool.mypy.overrides]]
+# 生成的 protobuf stub/模块为 grpcio-tools 产物，类型信息不完整，整体忽略。
+module = "med_langchain_memory.serde.med_session_pb2"
+ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
