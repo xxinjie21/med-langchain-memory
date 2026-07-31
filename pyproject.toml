@@ -76,3 +76,15 @@ ignore_errors = true
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
 pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["med_langchain_memory"]
+omit = ["src/med_langchain_memory/serde/med_session_pb2.py"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
