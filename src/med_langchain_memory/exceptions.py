@@ -21,3 +21,7 @@ class StateTransitionError(MedMemoryError):
 
 class StorageError(MedMemoryError):
     """存储适配器读写失败。"""
+
+
+class TenantIsolationError(MedMemoryError):
+    """跨租户 / 跨科室越权访问会话数据时抛出。"""
