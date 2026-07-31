@@ -28,10 +28,7 @@ def _message_block(text: str, name: str) -> str:
 
 def _field_numbers(block: str) -> dict[str, int]:
     """解析 message 块中 字段名 -> 字段号 的映射。"""
-    return {
-        name: int(num)
-        for name, num in re.findall(r"(\w+) = (\d+);", block)
-    }
+    return {name: int(num) for name, num in re.findall(r"(\w+) = (\d+);", block)}
 
 
 class TestProtoFile:

@@ -16,7 +16,9 @@ from med_langchain_memory.serde import ProtobufSerializer, SerializationError, S
 from med_langchain_memory.serde import med_session_pb2 as pb
 
 
-def _make_message(role: MessageRole = MessageRole.PATIENT, content: str = "主诉：咳嗽三天") -> MedMessage:
+def _make_message(
+    role: MessageRole = MessageRole.PATIENT, content: str = "主诉：咳嗽三天"
+) -> MedMessage:
     return MedMessage(
         session_id="s-001",
         tenant_id="t-001",
@@ -183,8 +185,6 @@ def test_serialize_snapshot_default_version() -> None:
 def test_serialize_snapshot_empty_messages() -> None:
     """快照可携带零条消息（边界用例）。"""
     ser = ProtobufSerializer()
-    meta, restored_msgs, _ = ser.deserialize_snapshot(
-        ser.serialize_snapshot(_make_session(), [])
-    )
+    meta, restored_msgs, _ = ser.deserialize_snapshot(ser.serialize_snapshot(_make_session(), []))
     assert meta == _make_session()
     assert restored_msgs == []
