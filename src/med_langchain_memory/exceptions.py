@@ -25,3 +25,11 @@ class StorageError(MedMemoryError):
 
 class TenantIsolationError(MedMemoryError):
     """跨租户 / 跨科室越权访问会话数据时抛出。"""
+
+
+class StoreRegistrationError(MedMemoryError):
+    """存储适配器注册失败（名称非法、重复注册或类型不合法）。"""
+
+
+class StoreNotFoundError(MedMemoryError):
+    """按名称查找存储适配器失败（未注册的后端）。"""
