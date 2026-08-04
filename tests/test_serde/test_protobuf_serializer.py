@@ -185,6 +185,7 @@ def test_serialize_snapshot_default_version() -> None:
 def test_serialize_snapshot_empty_messages() -> None:
     """快照可携带零条消息（边界用例）。"""
     ser = ProtobufSerializer()
-    meta, restored_msgs, _ = ser.deserialize_snapshot(ser.serialize_snapshot(_make_session(), []))
-    assert meta == _make_session()
+    session = _make_session()
+    meta, restored_msgs, _ = ser.deserialize_snapshot(ser.serialize_snapshot(session, []))
+    assert meta == session
     assert restored_msgs == []

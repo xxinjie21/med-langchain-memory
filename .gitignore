@@ -13,6 +13,7 @@ venv/
 # Test / coverage
 .pytest_cache/
 .ptmp/
+.ptmp2/
 .pytest-tmp/
 .coverage
 coverage.xml
