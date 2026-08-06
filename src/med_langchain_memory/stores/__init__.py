@@ -20,7 +20,8 @@ from .file_lock import FileLock
 from .file_store import FileFormat, FileMedHistory
 from .memory_store import InMemoryMedHistory
 
-with contextlib.suppress(ImportError):  # redis 为可选依赖，缺失时不注册该后端
+with contextlib.suppress(ImportError):  # redis 为可选依赖，缺失时不注册 redis 后端
+    from .redis_cluster_store import RedisClusterMedHistory, build_cluster_client
     from .redis_store import RedisMedHistory
 
 __all__ = [
@@ -30,9 +31,11 @@ __all__ = [
     "FileMedHistory",
     "InMemoryMedHistory",
     "MedChatMessageHistory",
+    "RedisClusterMedHistory",
     "RedisMedHistory",
     "StoreConfig",
     "StoreFactory",
+    "build_cluster_client",
     "from_langchain_message",
     "to_langchain_message",
 ]
