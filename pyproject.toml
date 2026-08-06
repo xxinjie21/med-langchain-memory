@@ -37,6 +37,7 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.5",
     "mypy>=1.10",
+    "redis>=5.0,<6",
     "fakeredis>=2.23",
     "pre-commit>=3.7",
     "grpcio-tools>=1.66",
