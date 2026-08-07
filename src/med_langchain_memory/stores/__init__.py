@@ -22,10 +22,11 @@ from .memory_store import InMemoryMedHistory
 
 with contextlib.suppress(ImportError):  # redis 为可选依赖，缺失时不注册 redis 后端
     from .redis_cluster_store import RedisClusterMedHistory, build_cluster_client
-    from .redis_store import RedisMedHistory
+    from .redis_store import ExpiryCallback, RedisMedHistory
 
 __all__ = [
     "MED_ROLE_KEY",
+    "ExpiryCallback",
     "FileFormat",
     "FileLock",
     "FileMedHistory",

@@ -3,7 +3,8 @@
 与单机版 :class:`RedisMedHistory` 的唯一差异在**键布局**：用 ``{}`` 把
 ``session_id`` 包成 Redis Cluster 的 hash tag，使得属于同一会话的两条键
 （消息 List 与元数据 Hash）都落在同一个 slot，从而满足集群事务 pipeline
-的单节点约束。存储逻辑（pipeline 批量写、元数据哈希累加、惰性 TTL 等）全部复用父类。
+的单节点约束。存储逻辑（pipeline 批量写、元数据哈希累加、会话级 TTL 等）全部复用父类；
+同 slot 保证也让 ``EXPIRE`` 两条键可以放在同一个事务 pipeline 里下发。
 
 ``client`` 必须是已建好的 :class:`redis.RedisCluster`（连接池由其构造函数配置，
 见 :func:`build_cluster_client`）；本类构造期**不发起任何网络请求**。
@@ -70,8 +71,8 @@ class RedisClusterMedHistory(RedisMedHistory):
         []
     """
 
-    #: 与单机版一致，原生 TTL 由后续迭代接入。
-    supports_ttl: ClassVar[bool] = False
+    #: 与单机版一致：hash tag 保证两条键同 slot，可直接复用父类的原生 TTL 实现。
+    supports_ttl: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -82,6 +83,7 @@ class RedisClusterMedHistory(RedisMedHistory):
         *,
         client: RedisCluster,
         ttl_seconds: int | None = None,
+        renew_on_read: bool = False,
     ) -> None:
         """初始化 Redis 集群会话历史。
 
@@ -91,10 +93,11 @@ class RedisClusterMedHistory(RedisMedHistory):
             dept_id: 科室 ID。
             patient_id: 患者 ID。
             client: 已建好且连接池已配置的 Redis 集群客户端。
-            ttl_seconds: 必须为 ``None``，本迭代尚未接入原生 TTL。
+            ttl_seconds: 会话级 TTL（秒）；``None`` 表示不设过期。
+            renew_on_read: 读取是否也参与滑动续期；默认仅写入续期。
 
         Raises:
-            ValidationError: ID 不合法时。
+            ValidationError: ID 不合法或 ``ttl_seconds`` 非正数时。
             StorageError: 未传入 ``client``，或客户端开启了 ``decode_responses`` 时。
         """
         if client is None:
@@ -102,15 +105,18 @@ class RedisClusterMedHistory(RedisMedHistory):
                 "redis-cluster backend requires an explicit `client` "
                 "(a configured redis.RedisCluster); build one via build_cluster_client(...)"
             )
+        # TTL 延后到重写键名之后再下发，否则 EXPIRE 会打在未加 tag 的旧键上。
         super().__init__(
             session_id,
             tenant_id,
             dept_id,
             patient_id,
             client=cast("Redis", client),
-            ttl_seconds=ttl_seconds,
+            renew_on_read=renew_on_read,
         )
         # 用 hash tag 包裹 session_id，确保 messages 与 meta 键落到同一 slot。
         tagged = f"med:chat:{self.tenant_id}:{self.dept_id}:{{{self.session_id}}}"
         self._messages_key = f"{tagged}{MESSAGES_SUFFIX}"
         self._meta_key = f"{tagged}{META_SUFFIX}"
+        if ttl_seconds is not None:
+            self.set_ttl(ttl_seconds)

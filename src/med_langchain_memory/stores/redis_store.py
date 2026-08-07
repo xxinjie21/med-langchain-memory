@@ -13,6 +13,15 @@
 一次 ``add_med_messages`` 的全部写命令（列表追加 + 元数据更新）打包进单个
 pipeline 事务提交，批量写只有一次网络往返。
 
+会话级 TTL 走 Redis 原生 ``EXPIRE``（两条键在同一 pipeline 事务内一起续期）：
+
+* **滑动续期**：每次写入后由基类 ``refresh_ttl()`` 重新计时；
+  构造时传 ``renew_on_read=True`` 可让读取也参与续期（活跃会话不会因只读而过期）；
+* **取消过期**：``set_ttl(None)`` 下发 ``PERSIST``，键恢复为永不过期；
+* **过期回调**：键过期由服务端完成、客户端无法被动感知，
+  故提供 :meth:`RedisMedHistory.on_expired` 注册回调 +
+  :meth:`RedisMedHistory.check_expiry` 主动探测，供 lifecycle 层归档调度轮询。
+
 注意：消息体是 protobuf 二进制，客户端**不得**开启 ``decode_responses``，
 构造时会显式校验。本后端为可选依赖（``pip install med-langchain-memory[redis]``），
 未安装 ``redis`` 时导入本模块会抛 ``ImportError``，:class:`StoreFactory` 中也不会出现 ``redis``。
@@ -22,7 +31,7 @@ pipeline 事务提交，批量写只有一次网络往返。
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import ClassVar, cast
 
@@ -47,6 +56,9 @@ META_SUFFIX = ":meta"
 #: 未显式注入客户端时使用的默认连接串。
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
+#: 会话过期回调签名：入参为探测到过期的历史实例。
+ExpiryCallback = Callable[["RedisMedHistory"], None]
+
 
 @StoreFactory.register("redis")
 class RedisMedHistory(MedChatMessageHistory):
@@ -68,8 +80,8 @@ class RedisMedHistory(MedChatMessageHistory):
         []
     """
 
-    #: 会话级原生 TTL 由 D12 迭代接入，当前迭代只做数据结构与批量写。
-    supports_ttl: ClassVar[bool] = False
+    #: 依托 Redis 原生 ``EXPIRE`` 支持会话级 TTL。
+    supports_ttl: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -81,6 +93,7 @@ class RedisMedHistory(MedChatMessageHistory):
         client: Redis | None = None,
         url: str = DEFAULT_REDIS_URL,
         ttl_seconds: int | None = None,
+        renew_on_read: bool = False,
     ) -> None:
         """初始化 Redis 会话历史。
 
@@ -91,18 +104,26 @@ class RedisMedHistory(MedChatMessageHistory):
             patient_id: 患者 ID。
             client: 已建好的 redis 客户端；为 ``None`` 时按 ``url`` 创建。
             url: redis 连接串，仅在 ``client`` 为 ``None`` 时生效。
-            ttl_seconds: 必须为 ``None``，本迭代尚未接入原生 TTL。
+            ttl_seconds: 会话级 TTL（秒）；``None`` 表示不设过期。
+                非 ``None`` 时构造阶段即下发一次 ``EXPIRE``（键不存在则为空操作）。
+            renew_on_read: 读取是否也参与滑动续期；默认仅写入续期。
 
         Raises:
-            ValidationError: ID 不合法时。
-            StorageError: 传入了 ``ttl_seconds``，或客户端开启了 ``decode_responses`` 时。
+            ValidationError: ID 不合法或 ``ttl_seconds`` 非正数时。
+            StorageError: 客户端开启了 ``decode_responses``，或下发 TTL 失败时。
         """
-        super().__init__(session_id, tenant_id, dept_id, patient_id, ttl_seconds=ttl_seconds)
+        super().__init__(session_id, tenant_id, dept_id, patient_id)
         self._client: Redis = Redis.from_url(url) if client is None else client
         self._assert_binary_client()
         self._serializer = ProtobufSerializer()
         self._messages_key = f"{self.storage_key}{MESSAGES_SUFFIX}"
         self._meta_key = f"{self.storage_key}{META_SUFFIX}"
+        self._renew_on_read = renew_on_read
+        self._expiry_callbacks: list[ExpiryCallback] = []
+        self._observed_present = False
+        self._expiry_fired = False
+        if ttl_seconds is not None:
+            self.set_ttl(ttl_seconds)
 
     # ------------------------------------------------------------------ #
     # 存储原语
@@ -117,6 +138,8 @@ class RedisMedHistory(MedChatMessageHistory):
             pipe.hset(self._meta_key, mapping=self._meta_mapping(now))
             pipe.hincrby(self._meta_key, "message_count", len(messages))
             pipe.execute()
+        self._observed_present = True
+        self._expiry_fired = False
 
     def _read(self, limit: int | None = None) -> list[MedMessage]:
         """读取整个列表并按 ``created_at`` 稳定排序；键不存在时返回空列表。
@@ -129,6 +152,8 @@ class RedisMedHistory(MedChatMessageHistory):
         """
         with self._guard("read"):
             raw = cast("list[bytes]", self._client.lrange(self._messages_key, 0, -1))
+        if self._renew_on_read and raw:
+            self.refresh_ttl()
         messages = [self._decode(index, blob) for index, blob in enumerate(raw)]
         messages.sort(key=lambda message: message.created_at)
         return messages if limit is None else messages[-limit:]
@@ -143,10 +168,110 @@ class RedisMedHistory(MedChatMessageHistory):
             pipe.delete(self._messages_key)
             pipe.delete(self._meta_key)
             pipe.execute()
+        # 显式清理不是"过期"，复位观察状态避免 check_expiry 误报。
+        self._observed_present = False
+        self._expiry_fired = False
+
+    # ------------------------------------------------------------------ #
+    # 会话级 TTL
+    # ------------------------------------------------------------------ #
+    def set_ttl(self, ttl_seconds: int | None) -> None:
+        """设置会话 TTL 并立即下发；``None`` 表示取消过期（下发 ``PERSIST``）。
+
+        Args:
+            ttl_seconds: 过期秒数；``None`` 取消已设置的过期时间。
+
+        Raises:
+            ValidationError: ``ttl_seconds`` 为非正数时。
+            StorageError: redis 命令失败时。
+        """
+        super().set_ttl(ttl_seconds)
+        if ttl_seconds is None:
+            self._persist()
+
+    def _apply_ttl(self, ttl_seconds: int) -> None:
+        """在单个 pipeline 事务内为消息列表与元数据哈希重新计时。
+
+        对不存在的键 ``EXPIRE`` 是空操作，因此空会话上调用同样安全。
+        """
+        with self._guard("expire"), self._client.pipeline(transaction=True) as pipe:
+            pipe.expire(self._messages_key, ttl_seconds)
+            pipe.expire(self._meta_key, ttl_seconds)
+            pipe.execute()
+
+    def ttl_remaining(self) -> int | None:
+        """读取消息列表键在 Redis 中的剩余存活秒数。
+
+        Returns:
+            剩余秒数；键不存在或未设置过期时返回 ``None``。
+
+        Raises:
+            StorageError: redis 命令失败时。
+        """
+        with self._guard("ttl"):
+            remaining = int(cast(int, self._client.ttl(self._messages_key)))
+        return remaining if remaining >= 0 else None
+
+    def exists(self) -> bool:
+        """判断本会话在 Redis 中是否仍有数据（消息列表或元数据任一存在）。
+
+        Raises:
+            StorageError: redis 命令失败时。
+        """
+        with self._guard("exists"):
+            return bool(self._client.exists(self._messages_key, self._meta_key))
+
+    def on_expired(self, callback: ExpiryCallback) -> None:
+        """注册会话过期回调，由 :meth:`check_expiry` 按注册顺序触发。
+
+        Args:
+            callback: 入参为本历史实例的可调用对象；同一实例可注册多个。
+        """
+        self._expiry_callbacks.append(callback)
+
+    def check_expiry(self) -> bool:
+        """主动探测会话是否已被 Redis 淘汰，首次探测到过期时触发回调。
+
+        键过期发生在服务端，客户端收不到通知，故由调用方（如 lifecycle 层的
+        归档调度器）定期轮询本方法。仅当本实例**曾观察到会话存在**（写入过消息，
+        或此前探测时键仍在）才可能判定为过期，避免把从未写入的新会话误判为过期。
+        会话被重新写入后过期状态自动复位，可再次触发回调。
+
+        Returns:
+            会话是否已过期；未设置 TTL 时恒为 ``False``。
+
+        Raises:
+            StorageError: redis 命令失败时；回调自身抛出的异常原样向上传播。
+        """
+        if self.ttl_seconds is None:
+            return False
+        if self.exists():
+            self._observed_present = True
+            self._expiry_fired = False
+            return False
+        if not self._observed_present:
+            return False
+        if not self._expiry_fired:
+            self._expiry_fired = True
+            for callback in self._expiry_callbacks:
+                callback(self)
+        return True
+
+    def _persist(self) -> None:
+        """移除两条键上的过期时间（键不存在时为空操作）。"""
+        with self._guard("persist"), self._client.pipeline(transaction=True) as pipe:
+            pipe.persist(self._messages_key)
+            pipe.persist(self._meta_key)
+            pipe.execute()
 
     # ------------------------------------------------------------------ #
     # Redis 后端专有能力
     # ------------------------------------------------------------------ #
+    @property
+    def renew_on_read(self) -> bool:
+        """读取是否参与滑动续期。"""
+        return self._renew_on_read
+
     @property
     def client(self) -> Redis:
         """底层 redis 客户端。"""
