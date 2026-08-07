@@ -1,9 +1,10 @@
 """RedisMedHistory 单元测试。
 
-分四部分：
+分五部分：
 
 * :class:`TestRedisStoreBehavior` 复用跨后端共享行为套件，校验通用存储契约；
 * 存储结构用例：List + Hash 键布局、protobuf 载荷、pipeline 单次往返、元数据累加；
+* TTL 用例：EXPIRE 下发、写入/读取滑动续期、PERSIST 取消、过期回调钩子；
 * 健壮性用例：损坏载荷、损坏元数据、``decode_responses`` 客户端、redis 异常包装；
 * 集成用例：工厂注册与配置驱动实例化。
 
@@ -23,7 +24,7 @@ from redis import Redis
 from redis.exceptions import RedisError
 
 from med_langchain_memory.domain import MedMessage, MessageRole, SessionStatus
-from med_langchain_memory.exceptions import StorageError
+from med_langchain_memory.exceptions import StorageError, ValidationError
 from med_langchain_memory.serde import ProtobufSerializer
 from med_langchain_memory.stores import StoreConfig, StoreFactory
 from med_langchain_memory.stores.redis_store import (
@@ -76,6 +77,12 @@ class _BoomClient:
         raise RedisError("connection lost")
 
     def hgetall(self, *args: Any, **kwargs: Any) -> Any:
+        raise RedisError("connection lost")
+
+    def ttl(self, *args: Any, **kwargs: Any) -> Any:
+        raise RedisError("connection lost")
+
+    def exists(self, *args: Any, **kwargs: Any) -> Any:
         raise RedisError("connection lost")
 
 
@@ -262,10 +269,224 @@ class TestRedisSpecificApi:
         assert meta is not None
         assert meta.message_count == 1
 
-    def test_ttl_is_not_supported_yet(self, history: RedisMedHistory) -> None:
-        assert RedisMedHistory.supports_ttl is False
-        with pytest.raises(StorageError, match="does not support native ttl"):
-            history.set_ttl(60)
+    def test_exists_is_false_for_new_session(self, history: RedisMedHistory) -> None:
+        assert history.exists() is False
+
+    def test_exists_is_true_after_write(self, history: RedisMedHistory) -> None:
+        history.add_med_messages([make_message()])
+
+        assert history.exists() is True
+
+
+# --------------------------------------------------------------------------- #
+# 会话级 TTL
+# --------------------------------------------------------------------------- #
+class TestSessionTtl:
+    """校验 EXPIRE 下发、滑动续期与 PERSIST 取消。"""
+
+    def test_backend_supports_native_ttl(self) -> None:
+        assert RedisMedHistory.supports_ttl is True
+
+    def test_set_ttl_expires_both_keys(
+        self, history: RedisMedHistory, client: fakeredis.FakeRedis
+    ) -> None:
+        history.add_med_messages([make_message()])
+
+        history.set_ttl(60)
+
+        assert history.ttl_seconds == 60
+        assert client.ttl(history.messages_key) == 60
+        assert client.ttl(history.meta_key) == 60
+
+    def test_constructor_ttl_is_applied_on_first_write(self, client: fakeredis.FakeRedis) -> None:
+        history = RedisMedHistory(**NAMESPACE, client=client, ttl_seconds=30)
+
+        history.add_med_messages([make_message()])
+
+        assert history.ttl_remaining() == 30
+
+    def test_set_ttl_on_empty_session_is_noop(self, history: RedisMedHistory) -> None:
+        history.set_ttl(60)
+
+        assert history.ttl_seconds == 60
+        assert history.ttl_remaining() is None  # 键还不存在，EXPIRE 无对象
+
+    def test_write_slides_expiration(
+        self, history: RedisMedHistory, client: fakeredis.FakeRedis
+    ) -> None:
+        history.set_ttl(100)
+        history.add_med_messages([make_message("first")])
+        client.expire(history.messages_key, 5)  # 模拟时间流逝后仅剩 5 秒
+        client.expire(history.meta_key, 5)
+
+        history.add_med_messages([make_message("second")])
+
+        assert client.ttl(history.messages_key) == 100
+        assert client.ttl(history.meta_key) == 100
+
+    def test_read_does_not_renew_by_default(
+        self, history: RedisMedHistory, client: fakeredis.FakeRedis
+    ) -> None:
+        history.set_ttl(100)
+        history.add_med_messages([make_message()])
+        client.expire(history.messages_key, 5)
+
+        history.get_med_messages()
+
+        assert history.renew_on_read is False
+        assert client.ttl(history.messages_key) == 5
+
+    def test_read_renews_when_enabled(self, client: fakeredis.FakeRedis) -> None:
+        history = RedisMedHistory(**NAMESPACE, client=client, ttl_seconds=100, renew_on_read=True)
+        history.add_med_messages([make_message()])
+        client.expire(history.messages_key, 5)
+        client.expire(history.meta_key, 5)
+
+        history.get_med_messages()
+
+        assert history.renew_on_read is True
+        assert client.ttl(history.messages_key) == 100
+
+    def test_read_on_empty_session_does_not_renew(self, client: fakeredis.FakeRedis) -> None:
+        history = RedisMedHistory(**NAMESPACE, client=client, ttl_seconds=100, renew_on_read=True)
+
+        assert history.get_med_messages() == []
+        assert history.ttl_remaining() is None
+
+    def test_set_ttl_none_persists_keys(
+        self, history: RedisMedHistory, client: fakeredis.FakeRedis
+    ) -> None:
+        history.set_ttl(60)
+        history.add_med_messages([make_message()])
+
+        history.set_ttl(None)
+
+        assert history.ttl_seconds is None
+        assert history.ttl_remaining() is None
+        assert client.exists(history.messages_key) == 1  # 取消过期而非删除数据
+        assert client.exists(history.meta_key) == 1
+
+    def test_ttl_remaining_is_none_without_ttl(self, history: RedisMedHistory) -> None:
+        history.add_med_messages([make_message()])
+
+        assert history.ttl_remaining() is None
+
+    def test_ttl_remaining_is_none_for_missing_key(self, history: RedisMedHistory) -> None:
+        assert history.ttl_remaining() is None
+
+    @pytest.mark.parametrize("ttl", [0, -1])
+    def test_set_ttl_rejects_non_positive(self, history: RedisMedHistory, ttl: int) -> None:
+        with pytest.raises(ValidationError, match="ttl_seconds must be"):
+            history.set_ttl(ttl)
+
+    def test_refresh_ttl_without_ttl_returns_false(self, history: RedisMedHistory) -> None:
+        assert history.refresh_ttl() is False
+
+
+# --------------------------------------------------------------------------- #
+# 过期回调钩子
+# --------------------------------------------------------------------------- #
+class TestExpiryCallback:
+    """校验 check_expiry 的探测语义与回调触发时机。"""
+
+    @staticmethod
+    def evict(history: RedisMedHistory, client: fakeredis.FakeRedis) -> None:
+        """模拟 Redis 服务端到期淘汰（直接删除两条键）。"""
+        client.delete(history.messages_key, history.meta_key)
+
+    def test_check_expiry_without_ttl_is_false(
+        self, history: RedisMedHistory, client: fakeredis.FakeRedis
+    ) -> None:
+        history.add_med_messages([make_message()])
+        self.evict(history, client)
+
+        assert history.check_expiry() is False
+
+    def test_check_expiry_is_false_while_session_alive(self, history: RedisMedHistory) -> None:
+        history.set_ttl(60)
+        history.add_med_messages([make_message()])
+
+        assert history.check_expiry() is False
+
+    def test_check_expiry_ignores_never_written_session(self, history: RedisMedHistory) -> None:
+        calls: list[RedisMedHistory] = []
+        history.on_expired(calls.append)
+        history.set_ttl(60)
+
+        assert history.check_expiry() is False
+        assert calls == []
+
+    def test_callback_fires_once_on_expiry(
+        self, history: RedisMedHistory, client: fakeredis.FakeRedis
+    ) -> None:
+        calls: list[RedisMedHistory] = []
+        history.on_expired(calls.append)
+        history.set_ttl(60)
+        history.add_med_messages([make_message()])
+
+        self.evict(history, client)
+
+        assert history.check_expiry() is True
+        assert history.check_expiry() is True  # 幂等：状态仍是过期
+        assert calls == [history]  # 但回调只触发一次
+
+    def test_callbacks_run_in_registration_order(
+        self, history: RedisMedHistory, client: fakeredis.FakeRedis
+    ) -> None:
+        order: list[str] = []
+        history.on_expired(lambda _: order.append("first"))
+        history.on_expired(lambda _: order.append("second"))
+        history.set_ttl(60)
+        history.add_med_messages([make_message()])
+
+        self.evict(history, client)
+        history.check_expiry()
+
+        assert order == ["first", "second"]
+
+    def test_callback_exception_propagates(
+        self, history: RedisMedHistory, client: fakeredis.FakeRedis
+    ) -> None:
+        def boom(_: RedisMedHistory) -> None:
+            raise RuntimeError("archiver down")
+
+        history.on_expired(boom)
+        history.set_ttl(60)
+        history.add_med_messages([make_message()])
+        self.evict(history, client)
+
+        with pytest.raises(RuntimeError, match="archiver down"):
+            history.check_expiry()
+
+    def test_expiry_state_resets_after_rewrite(
+        self, history: RedisMedHistory, client: fakeredis.FakeRedis
+    ) -> None:
+        calls: list[RedisMedHistory] = []
+        history.on_expired(calls.append)
+        history.set_ttl(60)
+        history.add_med_messages([make_message("first")])
+        self.evict(history, client)
+        history.check_expiry()
+
+        history.add_med_messages([make_message("second")])
+        assert history.check_expiry() is False
+
+        self.evict(history, client)
+        assert history.check_expiry() is True
+        assert len(calls) == 2
+
+    def test_clear_is_not_reported_as_expiry(
+        self, history: RedisMedHistory, client: fakeredis.FakeRedis
+    ) -> None:
+        calls: list[RedisMedHistory] = []
+        history.on_expired(calls.append)
+        history.set_ttl(60)
+        history.add_med_messages([make_message()])
+
+        history.clear()
+
+        assert history.check_expiry() is False
+        assert calls == []
 
 
 # --------------------------------------------------------------------------- #
@@ -333,6 +554,22 @@ class TestRobustness:
         with pytest.raises(StorageError, match="redis hgetall failed"):
             broken_history.fetch_session_meta()
 
+    def test_set_ttl_wraps_redis_error(self, broken_history: RedisMedHistory) -> None:
+        with pytest.raises(StorageError, match="redis expire failed"):
+            broken_history.set_ttl(60)
+
+    def test_persist_wraps_redis_error(self, broken_history: RedisMedHistory) -> None:
+        with pytest.raises(StorageError, match="redis persist failed"):
+            broken_history.set_ttl(None)
+
+    def test_ttl_remaining_wraps_redis_error(self, broken_history: RedisMedHistory) -> None:
+        with pytest.raises(StorageError, match="redis ttl failed"):
+            broken_history.ttl_remaining()
+
+    def test_exists_wraps_redis_error(self, broken_history: RedisMedHistory) -> None:
+        with pytest.raises(StorageError, match="redis exists failed"):
+            broken_history.exists()
+
 
 # --------------------------------------------------------------------------- #
 # 工厂集成
@@ -362,3 +599,11 @@ class TestFactoryIntegration:
     def test_create_with_unknown_option_raises(self, client: fakeredis.FakeRedis) -> None:
         with pytest.raises(StorageError, match="cannot build RedisMedHistory"):
             StoreFactory.create("redis", **NAMESPACE, client=client, unknown_option=1)
+
+    def test_create_from_config_with_ttl(self, client: fakeredis.FakeRedis) -> None:
+        config = StoreConfig(backend="redis", ttl_seconds=45, options={"client": client})
+
+        built = StoreFactory.create_from_config(config, **NAMESPACE)
+
+        assert isinstance(built, RedisMedHistory)
+        assert built.ttl_seconds == 45

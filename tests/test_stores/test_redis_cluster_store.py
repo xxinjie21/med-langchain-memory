@@ -141,6 +141,35 @@ class TestHashTagKeys:
 
 
 # --------------------------------------------------------------------------- #
+# 集群 TTL
+# --------------------------------------------------------------------------- #
+class TestClusterTtl:
+    """校验 TTL 打在带 hash tag 的键上（同 slot 才能走事务 pipeline）。"""
+
+    def test_supports_native_ttl(self) -> None:
+        assert RedisClusterMedHistory.supports_ttl is True
+
+    def test_constructor_ttl_expires_tagged_keys(self, client: fakeredis.FakeRedis) -> None:
+        history = RedisClusterMedHistory(**NAMESPACE, client=client, ttl_seconds=50)
+
+        history.add_med_messages([make_message()])
+
+        assert history.messages_key == f"{TAGGED_BASE}:messages"
+        assert client.ttl(history.messages_key) == 50
+        assert client.ttl(history.meta_key) == 50
+        assert client.ttl(f"{STORAGE_KEY}:messages") == -2  # 未加 tag 的旧键不应被写入
+
+    def test_set_ttl_none_persists_tagged_keys(self, history: RedisClusterMedHistory) -> None:
+        history.set_ttl(60)
+        history.add_med_messages([make_message()])
+
+        history.set_ttl(None)
+
+        assert history.ttl_remaining() is None
+        assert history.exists() is True
+
+
+# --------------------------------------------------------------------------- #
 # 连接池配置入口
 # --------------------------------------------------------------------------- #
 class TestBuildClusterClient:
