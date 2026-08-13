@@ -33,3 +33,7 @@ class StoreRegistrationError(MedMemoryError):
 
 class StoreNotFoundError(MedMemoryError):
     """按名称查找存储适配器失败（未注册的后端）。"""
+
+
+class IntegrityError(MedMemoryError):
+    """数据完整性校验失败（如快照文件包校验和不匹配、内容损坏）。"""
