@@ -1,8 +1,8 @@
 """会话生命周期层：跨存储迁移、TTL 归档、快照与合规保留。
 
-本模块当前实现跨存储迁移器 :class:`Migrator` 与会话快照备份/恢复
-:class:`SessionSnapshotter`。后续迭代将补充 TTL 归档调度与软删除保留期等能力。
-本层不含任何文本内容解析逻辑。
+本模块当前实现跨存储迁移器 :class:`Migrator`、TTL 自动归档调度器
+:class:`TtlArchiver` 与会话快照备份/恢复 :class:`SessionSnapshotter`。
+后续迭代将补充软删除保留期等能力。本层不含任何文本内容解析逻辑。
 """
 
 from __future__ import annotations
@@ -21,6 +21,12 @@ from .snapshot import (
     restore_session,
     snapshot_session,
 )
+from .ttl_archiver import (
+    ArchiveReport,
+    ArchiveResult,
+    TtlArchiver,
+    archive_expired_session,
+)
 
 __all__ = [
     "MigrationCursor",
@@ -33,4 +39,8 @@ __all__ = [
     "SnapshotSummary",
     "restore_session",
     "snapshot_session",
+    "ArchiveReport",
+    "ArchiveResult",
+    "TtlArchiver",
+    "archive_expired_session",
 ]
