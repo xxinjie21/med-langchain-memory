@@ -236,6 +236,14 @@ class MedChatMessageHistory(BaseChatMessageHistory, ABC):
         """当前会话元数据快照（不可变对象）。"""
         return self._meta
 
+    @property
+    def is_deleted(self) -> bool:
+        """会话是否已软删除（状态为 ``DELETED``）。
+
+        供上层做查询过滤：已软删除的会话不应再返回给普通查询。
+        """
+        return self._meta.status is SessionStatus.DELETED
+
     def belongs_to(self, tenant_id: str, dept_id: str | None = None) -> bool:
         """判断本会话是否属于给定租户（可选科室）。"""
         if tenant_id != self.tenant_id:
@@ -386,6 +394,24 @@ class MedChatMessageHistory(BaseChatMessageHistory, ABC):
         """
         messages = self._read()
         self._meta = self._meta.transition_to(SessionStatus.ARCHIVED)
+        return self._meta, messages
+
+    def delete(self) -> tuple[SessionMeta, list[MedMessage]]:
+        """将会话流转至 ``DELETED``（软删除标记）并导出全量消息。
+
+        仅允许从 ``ARCHIVED`` 状态流转（与领域层状态机一致），其余状态
+        （``ACTIVE`` / ``CLOSED`` / ``DELETED``）会触发 :class:`StateTransitionError`。
+        本方法只负责状态流转与数据导出，不清理消息数据——物理清理由生命周期层
+        保留期策略在宽限期后执行。
+
+        Returns:
+            ``(删除后的会话元数据, 全量消息)``。
+
+        Raises:
+            StateTransitionError: 当前状态不允许软删除（非 ``ARCHIVED``）时。
+        """
+        messages = self._read()
+        self._meta = self._meta.transition_to(SessionStatus.DELETED)
         return self._meta, messages
 
     # ------------------------------------------------------------------ #
