@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from .audit import (
+    AuditAction,
+    AuditEvent,
+    AuditSink,
+    AuditStatus,
+    FileAuditSink,
+    InMemoryAuditSink,
+    make_audit_event,
+)
 from .message import MedMessage, MessageRole, new_message_id
 from .session import SessionMeta, SessionStatus
 
@@ -11,4 +20,11 @@ __all__ = [
     "new_message_id",
     "SessionMeta",
     "SessionStatus",
+    "AuditAction",
+    "AuditEvent",
+    "AuditStatus",
+    "AuditSink",
+    "InMemoryAuditSink",
+    "FileAuditSink",
+    "make_audit_event",
 ]

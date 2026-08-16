@@ -80,9 +80,7 @@ def make_messages(n: int, **overrides) -> list[MedMessage]:
 def _rewind(history: MedChatMessageHistory, days: int) -> None:
     """将会话元数据的 created_at/updated_at 回拨 ``days`` 天，模拟历史时间戳。"""
     old = now_millis() - days * MS_DAY - 1000
-    history._meta = history._meta.model_copy(
-        update={"created_at": old, "updated_at": old}
-    )
+    history._meta = history._meta.model_copy(update={"created_at": old, "updated_at": old})
 
 
 def make_archived(days_old: int) -> FakeHistory:
@@ -318,9 +316,7 @@ class TestRetentionManagerRun:
         assert before.purged == 0
         assert before.skipped == 1
         # 超过宽限期 -> 清理
-        after = manager.run(
-            now_ms=sessions["only"].session_meta.updated_at + 8 * MS_DAY
-        )
+        after = manager.run(now_ms=sessions["only"].session_meta.updated_at + 8 * MS_DAY)
         assert after.purged == 1
 
 

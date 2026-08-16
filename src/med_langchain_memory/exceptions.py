@@ -37,3 +37,7 @@ class StoreNotFoundError(MedMemoryError):
 
 class IntegrityError(MedMemoryError):
     """数据完整性校验失败（如快照文件包校验和不匹配、内容损坏）。"""
+
+
+class AuditSinkError(MedMemoryError):
+    """审计事件落盘失败（路径不可写、磁盘 IO 异常等）。"""

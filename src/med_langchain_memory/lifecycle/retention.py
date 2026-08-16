@@ -64,9 +64,8 @@ class RetentionPolicy:
         Returns:
             仅当状态为 ``ARCHIVED`` 且距 ``updated_at`` 已超过 ``retention_days`` 时为 ``True``。
         """
-        return (
-            meta.status is SessionStatus.ARCHIVED
-            and now_ms - meta.updated_at >= _days_to_ms(self.retention_days)
+        return meta.status is SessionStatus.ARCHIVED and now_ms - meta.updated_at >= _days_to_ms(
+            self.retention_days
         )
 
     def is_due_for_purge(self, meta: SessionMeta, now_ms: int) -> bool:
@@ -79,9 +78,8 @@ class RetentionPolicy:
         Returns:
             仅当状态为 ``DELETED`` 且距 ``updated_at`` 已超过 ``grace_days`` 时为 ``True``。
         """
-        return (
-            meta.status is SessionStatus.DELETED
-            and now_ms - meta.updated_at >= _days_to_ms(self.grace_days)
+        return meta.status is SessionStatus.DELETED and now_ms - meta.updated_at >= _days_to_ms(
+            self.grace_days
         )
 
 
@@ -308,29 +306,31 @@ class RetentionManager:
                 meta = history.session_meta
                 if meta.status is SessionStatus.ARCHIVED:
                     if self._policy.is_due_for_soft_delete(meta, now):
-                        res = self.soft_delete(history)
+                        soft = self.soft_delete(history)
                         item = SessionRetentionResult(
-                            session_key=res.session_key,
-                            soft_deleted=res.deleted,
-                            reason=res.reason,
+                            session_key=soft.session_key,
+                            soft_deleted=soft.deleted,
+                            reason=soft.reason,
                         )
-                        if res.deleted:
+                        if soft.deleted:
                             report.soft_deleted += 1
                         else:
                             report.skipped += 1
                     else:
-                        item = SessionRetentionResult(session_key=key, reason="retention_not_elapsed")
+                        item = SessionRetentionResult(
+                            session_key=key, reason="retention_not_elapsed"
+                        )
                         report.skipped += 1
                 elif meta.status is SessionStatus.DELETED:
                     if self._policy.is_due_for_purge(meta, now):
-                        res = self.purge(history, now_ms=now)
+                        purged = self.purge(history, now_ms=now)
                         item = SessionRetentionResult(
-                            session_key=res.session_key,
-                            purged=res.purged,
-                            purged_count=res.purged_count,
-                            reason=res.reason,
+                            session_key=purged.session_key,
+                            purged=purged.purged,
+                            purged_count=purged.purged_count,
+                            reason=purged.reason,
                         )
-                        if res.purged:
+                        if purged.purged:
                             report.purged += 1
                             if self._after_purge is not None:
                                 self._after_purge(key)
@@ -340,7 +340,9 @@ class RetentionManager:
                         item = SessionRetentionResult(session_key=key, reason="grace_not_elapsed")
                         report.skipped += 1
                 else:
-                    item = SessionRetentionResult(session_key=key, reason=f"status:{meta.status.value}")
+                    item = SessionRetentionResult(
+                        session_key=key, reason=f"status:{meta.status.value}"
+                    )
                     report.skipped += 1
             except Exception as exc:  # 容忍单会话失败，保证调度整体推进
                 report.failed += 1
