@@ -21,6 +21,13 @@ from .masker import (
     default_masker,
     mask_text,
 )
+from .policies import (
+    BUILTIN_RULES_BY_NAME,
+    MaskPolicy,
+    PolicyConfig,
+    PolicyMasker,
+    default_policy,
+)
 
 __all__ = [
     "MaskRule",
@@ -35,4 +42,9 @@ __all__ = [
     "BED_NO_SUFFIX_RULE",
     "default_masker",
     "mask_text",
+    "MaskPolicy",
+    "PolicyConfig",
+    "PolicyMasker",
+    "BUILTIN_RULES_BY_NAME",
+    "default_policy",
 ]
