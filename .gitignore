@@ -35,3 +35,9 @@ Thumbs.db
 .workbuddy/
 
 .ptmp3/
+
+# pytest sandbox temp dirs
+.pytest_fresh/
+.pytest_tmp/
+.ptmp_run/
+.pytest_result.log
