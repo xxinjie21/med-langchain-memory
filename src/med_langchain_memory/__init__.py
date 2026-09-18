@@ -9,8 +9,19 @@ rule-based field-level privacy masking, and a medical-enhanced
 ``RunnableWithMessageHistory``.
 """
 
-from .runnable import MedRunnableWithMessageHistory
+from .runnable import (
+    MedRunnableWithMessageHistory,
+    SessionNamespace,
+    TenantContext,
+    TenantGuard,
+)
 
 __version__ = "0.1.0"
 
-__all__ = ["MedRunnableWithMessageHistory", "__version__"]
+__all__ = [
+    "MedRunnableWithMessageHistory",
+    "SessionNamespace",
+    "TenantContext",
+    "TenantGuard",
+    "__version__",
+]

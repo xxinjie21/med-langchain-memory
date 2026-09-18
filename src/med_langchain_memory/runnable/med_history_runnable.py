@@ -7,8 +7,9 @@
 
 会话命名空间由必填的 ``session_id`` 与可配置的 ``tenant_id`` / ``dept_id`` /
 ``patient_id`` 三段式组成（与存储层键规范一致，``patient_id`` 缺省时回退默认值）。
-后续迭代（D24 多租户隔离、D25+ 上下文裁剪/摘要压缩）将在此基础上叠加增强能力，
-本迭代只完成「继承封装 + 注入存储工厂」的最小可用骨架。
+D24 起支持注入 :class:`~.tenant.TenantContext`：若给定调用方身份，取用历史前会先做
+``tenant_id:dept_id`` 归属校验，跨租户 / 跨科室访问直接拒绝，不再落到存储层。
+后续迭代（D25+ 上下文裁剪/摘要压缩）将在此基础上叠加增强能力。
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ from langchain_core.runnables.history import (
 )
 
 from med_langchain_memory.stores import MedChatMessageHistory, StoreFactory
+
+from .tenant import TenantContext
 
 #: 除 ``session_id`` 外参与会话命名空间的配置字段（与存储键规范一致）。
 _NAMESPACE_FIELDS: tuple[str, ...] = ("tenant_id", "dept_id", "patient_id")
@@ -46,9 +49,11 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         output_messages_key: 包裹 Runnable 输出中承载消息的键。
         history_messages_key: 注入历史消息的占位符键。
         default_namespace: 命名空间默认值，当调用方在 ``config`` 中留空时取用。
+        tenant_context: 调用方租户身份；非空时对本 Runnable 取用的每个会话做归属校验。
 
     Raises:
         StoreNotFoundError: 通过本 Runnable 取用时 ``backend`` 未注册（在 ``invoke`` 时触发）。
+        TenantIsolationError: 注入了 ``tenant_context`` 而调用方请求了越权命名空间时。
     """
 
     def __init__(
@@ -63,14 +68,19 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         output_messages_key: str | None = None,
         history_messages_key: str | None = None,
         default_namespace: Mapping[str, str] | None = None,
+        tenant_context: TenantContext | None = None,
     ) -> None:
-        self._backend = backend
-        self._store_factory = store_factory
-        self._ttl_seconds = ttl_seconds
-        self._store_options = dict(store_options or {})
-        self._default_namespace = dict(default_namespace or {})
+        options = dict(store_options or {})
+        defaults = dict(default_namespace or {})
 
-        get_history = self._make_get_session_history()
+        get_history = self._make_get_session_history(
+            backend=backend,
+            factory=store_factory,
+            ttl=ttl_seconds,
+            options=options,
+            defaults=defaults,
+            context=tenant_context,
+        )
         factory_config = self._build_history_factory_config()
 
         super().__init__(
@@ -82,22 +92,44 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
             history_factory_config=factory_config,
         )
 
+        # 注意：RunnableWithMessageHistory 是 pydantic 模型，其 ``__init__`` 会整体
+        # 替换实例 ``__dict__``，故私有状态必须在 super().__init__() **之后**赋值。
+        self._backend = backend
+        self._store_factory = store_factory
+        self._ttl_seconds = ttl_seconds
+        self._store_options = options
+        self._default_namespace = defaults
+        self._tenant_context = tenant_context
+
     # ------------------------------------------------------------------ #
     # 内部构造助手
     # ------------------------------------------------------------------ #
-    def _make_get_session_history(self) -> GetSessionHistoryCallable:
+    def _make_get_session_history(
+        self,
+        *,
+        backend: str,
+        factory: type[StoreFactory],
+        ttl: int | None,
+        options: Mapping[str, Any],
+        defaults: Mapping[str, str],
+        context: TenantContext | None,
+    ) -> GetSessionHistoryCallable:
         """构造 ``get_session_history`` 闭包。
+
+        Args:
+            backend: 已注册的后端名。
+            factory: 存储工厂（类或兼容 ``create`` 签名的对象）。
+            ttl: 会话级 TTL（秒）。
+            options: 透传给存储实现的额外参数。
+            defaults: 命名空间默认值。
+            context: 调用方租户身份；``None`` 表示不做归属校验。
 
         Returns:
             签名与 ``history_factory_config`` 字段一一对应的可调用对象，
             调用时按命名空间实例化 ``MedChatMessageHistory``；命名空间字段留空时
-            回退到 :attr:`_default_namespace` 中登记的默认值。
+            依次回退到 ``defaults`` 与 ``context``；注入了租户身份时，解析完命名空间
+            后先做归属校验再创建句柄。
         """
-        backend = self._backend
-        factory = self._store_factory
-        ttl = self._ttl_seconds
-        options = self._store_options
-        defaults = self._default_namespace
 
         def get_session_history(
             session_id: str,
@@ -107,6 +139,10 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         ) -> MedChatMessageHistory:
             resolved_tenant = tenant_id or defaults.get("tenant_id", "")
             resolved_dept = dept_id or defaults.get("dept_id", "")
+            if context is not None:
+                resolved_tenant = resolved_tenant or context.tenant_id
+                resolved_dept = resolved_dept or context.dept_id
+                context.assert_access(resolved_tenant, resolved_dept)
             resolved_patient = patient_id or defaults.get("patient_id", "")
             return factory.create(
                 backend,
@@ -131,6 +167,14 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         return specs
 
     # ------------------------------------------------------------------ #
+    # 属性
+    # ------------------------------------------------------------------ #
+    @property
+    def tenant_context(self) -> TenantContext | None:
+        """注入的调用方租户身份；``None`` 表示本 Runnable 不做归属校验。"""
+        return self._tenant_context
+
+    # ------------------------------------------------------------------ #
     # 调用辅助
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -138,15 +182,15 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         session_id: str,
         tenant_id: str,
         dept_id: str,
-        patient_id: str,
+        patient_id: str = "",
     ) -> dict[str, Any]:
         """构造调用本 Runnable 所需的 ``config`` 字典。
 
         Args:
-            session_id: 会话 ID。
-            tenant_id: 医院/机构租户 ID。
-            dept_id: 科室 ID。
-            patient_id: 患者 ID。
+        session_id: 会话 ID。
+        tenant_id: 医院/机构租户 ID。
+        dept_id: 科室 ID。
+            patient_id: 患者 ID，缺省为空。
 
         Returns:
             ``{"configurable": {...}}`` 形式的调用配置。
