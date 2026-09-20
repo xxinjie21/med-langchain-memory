@@ -9,14 +9,16 @@
 ``patient_id`` 三段式组成（与存储层键规范一致，``patient_id`` 缺省时回退默认值）。
 D24 起支持注入 :class:`~.tenant.TenantContext`：若给定调用方身份，取用历史前会先做
 ``tenant_id:dept_id`` 归属校验，跨租户 / 跨科室访问直接拒绝，不再落到存储层。
-后续迭代（D25+ 上下文裁剪/摘要压缩）将在此基础上叠加增强能力。
+D25 起可选注入 :class:`~.trimmer.ContextWindowPolicy`，通过 :meth:`trim_context`
+对取用的历史做时序滑动窗口裁剪；后续迭代（D26+ Token 预算 / 摘要压缩）将在此基础上叠加。
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
+from langchain_core.messages import BaseMessage
 from langchain_core.runnables import ConfigurableFieldSpec
 from langchain_core.runnables.history import (
     GetSessionHistoryCallable,
@@ -26,6 +28,7 @@ from langchain_core.runnables.history import (
 from med_langchain_memory.stores import MedChatMessageHistory, StoreFactory
 
 from .tenant import TenantContext
+from .trimmer import ContextWindowPolicy, TimeWindowTrimmer
 
 #: 除 ``session_id`` 外参与会话命名空间的配置字段（与存储键规范一致）。
 _NAMESPACE_FIELDS: tuple[str, ...] = ("tenant_id", "dept_id", "patient_id")
@@ -50,6 +53,7 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         history_messages_key: 注入历史消息的占位符键。
         default_namespace: 命名空间默认值，当调用方在 ``config`` 中留空时取用。
         tenant_context: 调用方租户身份；非空时对本 Runnable 取用的每个会话做归属校验。
+        trim_policy: 时序裁剪策略；非空时可用 :meth:`trim_context` 裁剪历史上下文。
 
     Raises:
         StoreNotFoundError: 通过本 Runnable 取用时 ``backend`` 未注册（在 ``invoke`` 时触发）。
@@ -69,6 +73,7 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         history_messages_key: str | None = None,
         default_namespace: Mapping[str, str] | None = None,
         tenant_context: TenantContext | None = None,
+        trim_policy: ContextWindowPolicy | None = None,
     ) -> None:
         options = dict(store_options or {})
         defaults = dict(default_namespace or {})
@@ -100,6 +105,7 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         self._store_options = options
         self._default_namespace = defaults
         self._tenant_context = tenant_context
+        self._trim_policy = trim_policy
 
     # ------------------------------------------------------------------ #
     # 内部构造助手
@@ -174,9 +180,33 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         """注入的调用方租户身份；``None`` 表示本 Runnable 不做归属校验。"""
         return self._tenant_context
 
+    @property
+    def trim_policy(self) -> ContextWindowPolicy | None:
+        """注入的时序裁剪策略；``None`` 表示不裁剪。"""
+        return self._trim_policy
+
     # ------------------------------------------------------------------ #
     # 调用辅助
     # ------------------------------------------------------------------ #
+    def trim_context(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        now_ms: int | None = None,
+    ) -> list[BaseMessage]:
+        """按注入的裁剪策略裁剪上下文消息。
+
+        Args:
+            messages: 时序升序的消息序列。
+            now_ms: 当前 epoch 毫秒，缺省取系统时间。
+
+        Returns:
+            裁剪后的消息列表；未注入策略时返回入参的等价副本。
+        """
+        if self._trim_policy is None:
+            return list(messages)
+        return TimeWindowTrimmer(self._trim_policy).trim(messages, now_ms=now_ms)
+
     @staticmethod
     def build_config(
         session_id: str,

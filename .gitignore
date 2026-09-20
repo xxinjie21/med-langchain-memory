@@ -33,6 +33,7 @@ Thumbs.db
 
 # WorkBuddy local data (keep memory out of VCS)
 .workbuddy/
+.workbuddy-ai/
 
 .ptmp3/
 
