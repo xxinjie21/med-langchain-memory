@@ -10,7 +10,9 @@
 D24 起支持注入 :class:`~.tenant.TenantContext`：若给定调用方身份，取用历史前会先做
 ``tenant_id:dept_id`` 归属校验，跨租户 / 跨科室访问直接拒绝，不再落到存储层。
 D25 起可选注入 :class:`~.trimmer.ContextWindowPolicy`，通过 :meth:`trim_context`
-对取用的历史做时序滑动窗口裁剪；后续迭代（D26+ Token 预算 / 摘要压缩）将在此基础上叠加。
+对取用的历史做时序滑动窗口裁剪；D26 起可再叠加 :class:`~.token_budget.TokenBudgetPolicy`，
+由 :meth:`build_context` 按「时序窗口 → Token 预算」两级流水线产出最终上下文，
+并返回带告警的结构化报告；后续迭代（D27+ 摘要压缩）将在此基础上继续叠加。
 """
 
 from __future__ import annotations
@@ -28,6 +30,14 @@ from langchain_core.runnables.history import (
 from med_langchain_memory.stores import MedChatMessageHistory, StoreFactory
 
 from .tenant import TenantContext
+from .token_budget import (
+    TokenBudgetPolicy,
+    TokenBudgetTrimmer,
+    TokenCounter,
+    TokenTrimReport,
+    TokenTrimResult,
+    resolve_token_counter,
+)
 from .trimmer import ContextWindowPolicy, TimeWindowTrimmer
 
 #: 除 ``session_id`` 外参与会话命名空间的配置字段（与存储键规范一致）。
@@ -54,10 +64,15 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         default_namespace: 命名空间默认值，当调用方在 ``config`` 中留空时取用。
         tenant_context: 调用方租户身份；非空时对本 Runnable 取用的每个会话做归属校验。
         trim_policy: 时序裁剪策略；非空时可用 :meth:`trim_context` 裁剪历史上下文。
+        token_budget: Token 预算策略；非空时 :meth:`build_context` 会在时序裁剪之后
+            追加一层预算裁剪。
+        token_counter: token 计数器实例或名称（``"heuristic"`` / ``"tiktoken"`` /
+            tiktoken 编码表名）；``None`` 表示使用零依赖的启发式计数器。
 
     Raises:
         StoreNotFoundError: 通过本 Runnable 取用时 ``backend`` 未注册（在 ``invoke`` 时触发）。
         TenantIsolationError: 注入了 ``tenant_context`` 而调用方请求了越权命名空间时。
+        ValueError: ``token_counter`` 为未知名称时。
     """
 
     def __init__(
@@ -74,9 +89,12 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         default_namespace: Mapping[str, str] | None = None,
         tenant_context: TenantContext | None = None,
         trim_policy: ContextWindowPolicy | None = None,
+        token_budget: TokenBudgetPolicy | None = None,
+        token_counter: TokenCounter | str | None = None,
     ) -> None:
         options = dict(store_options or {})
         defaults = dict(default_namespace or {})
+        counter = resolve_token_counter(token_counter)
 
         get_history = self._make_get_session_history(
             backend=backend,
@@ -106,6 +124,8 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         self._default_namespace = defaults
         self._tenant_context = tenant_context
         self._trim_policy = trim_policy
+        self._token_budget = token_budget
+        self._token_counter = counter
 
     # ------------------------------------------------------------------ #
     # 内部构造助手
@@ -185,6 +205,16 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         """注入的时序裁剪策略；``None`` 表示不裁剪。"""
         return self._trim_policy
 
+    @property
+    def token_budget(self) -> TokenBudgetPolicy | None:
+        """注入的 Token 预算策略；``None`` 表示不做预算裁剪。"""
+        return self._token_budget
+
+    @property
+    def token_counter(self) -> TokenCounter:
+        """本 Runnable 使用的 token 计数器。"""
+        return self._token_counter
+
     # ------------------------------------------------------------------ #
     # 调用辅助
     # ------------------------------------------------------------------ #
@@ -206,6 +236,30 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         if self._trim_policy is None:
             return list(messages)
         return TimeWindowTrimmer(self._trim_policy).trim(messages, now_ms=now_ms)
+
+    def build_context(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        now_ms: int | None = None,
+    ) -> TokenTrimResult:
+        """按「时序窗口 → Token 预算」两级流水线构建最终上下文。
+
+        先应用 :attr:`trim_policy`（若注入）做时序滑动窗口裁剪，再应用
+        :attr:`token_budget`（若注入）做预算内贪心裁剪；两级均未注入时原样返回。
+
+        Args:
+            messages: 时序升序的消息序列。
+            now_ms: 当前 epoch 毫秒，缺省取系统时间（仅时序窗口生效时使用）。
+
+        Returns:
+            裁剪结果：``messages`` 为最终上下文，``report`` 为预算裁剪报告
+            （未注入预算策略时 ``report.applied`` 为 ``False``）。
+        """
+        trimmed = self.trim_context(messages, now_ms=now_ms)
+        if self._token_budget is None:
+            return TokenTrimResult(messages=trimmed, report=TokenTrimReport())
+        return TokenBudgetTrimmer(self._token_budget, counter=self._token_counter).trim(trimmed)
 
     @staticmethod
     def build_config(

@@ -51,7 +51,9 @@ _NAMESPACE: dict[str, str] = {
 }
 
 
-def _med(role: MessageRole, content: str, created_at: int, session_id: str = SESSION_ID) -> MedMessage:
+def _med(
+    role: MessageRole, content: str, created_at: int, session_id: str = SESSION_ID
+) -> MedMessage:
     """构造一条固定命名空间的医疗消息。"""
     return MedMessage(
         role=role,
@@ -208,7 +210,10 @@ def test_find_chief_complaint_returns_first_patient_message() -> None:
 
 def test_find_chief_complaint_returns_none_without_patient() -> None:
     """会话中不存在患者消息时返回 ``None``。"""
-    messages = [_msg(MessageRole.DOCTOR, "问诊", BASE_MS), _msg(MessageRole.ASSISTANT, "建议", BASE_MS)]
+    messages = [
+        _msg(MessageRole.DOCTOR, "问诊", BASE_MS),
+        _msg(MessageRole.ASSISTANT, "建议", BASE_MS),
+    ]
 
     assert find_chief_complaint(messages) is None
 
@@ -268,9 +273,7 @@ def test_trim_without_limits_returns_copy() -> None:
 def test_trim_by_count_keeps_latest_messages_in_order() -> None:
     """按条数裁剪保留会话尾部消息，且保持时序升序。"""
     messages = _conversation(5)
-    trimmer = TimeWindowTrimmer(
-        ContextWindowPolicy(max_messages=2, keep_chief_complaint=False)
-    )
+    trimmer = TimeWindowTrimmer(ContextWindowPolicy(max_messages=2, keep_chief_complaint=False))
 
     assert _contents(trimmer.trim(messages)) == ["m3", "m4"]
 
@@ -424,7 +427,10 @@ def test_trim_history_honours_explicit_now_ms() -> None:
     """``trim_history`` 支持显式基准时间，陈旧历史只保留受保护位。"""
     history = InMemoryMedHistory(**{**_NAMESPACE, "session_id": "s-trim-stale"})
     history.add_med_messages(
-        [_med(MessageRole.PATIENT, f"m{i}", BASE_MS + i, session_id="s-trim-stale") for i in range(3)]
+        [
+            _med(MessageRole.PATIENT, f"m{i}", BASE_MS + i, session_id="s-trim-stale")
+            for i in range(3)
+        ]
     )
     trimmer = TimeWindowTrimmer(ContextWindowPolicy(max_age_seconds=1))
 

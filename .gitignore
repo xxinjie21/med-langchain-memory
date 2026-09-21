@@ -43,3 +43,4 @@ Thumbs.db
 .ptmp_run/
 .pytest_result.log
 .pytest_junit.xml
+.pytest-report.xml

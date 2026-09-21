@@ -43,6 +43,7 @@ dev = [
     "elasticsearch>=8.0,<9",
     "pre-commit>=3.7",
     "grpcio-tools>=1.66",
+    "tiktoken>=0.7",
 ]
 
 [project.urls]
