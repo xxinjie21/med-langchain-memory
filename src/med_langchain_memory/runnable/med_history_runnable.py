@@ -12,7 +12,9 @@ D24 起支持注入 :class:`~.tenant.TenantContext`：若给定调用方身份�
 D25 起可选注入 :class:`~.trimmer.ContextWindowPolicy`，通过 :meth:`trim_context`
 对取用的历史做时序滑动窗口裁剪；D26 起可再叠加 :class:`~.token_budget.TokenBudgetPolicy`，
 由 :meth:`build_context` 按「时序窗口 → Token 预算」两级流水线产出最终上下文，
-并返回带告警的结构化报告；后续迭代（D27+ 摘要压缩）将在此基础上继续叠加。
+并返回带告警的结构化报告；D27 起可再注入 :class:`~.summarizer.SummaryPolicy` 与
+摘要链，流水线升级为「时序窗口 → LLM 摘要压缩 → Token 预算」三级：中间段旧消息被
+折叠成一条带区间标记的 system 摘要消息后再做预算兜底裁剪。
 """
 
 from __future__ import annotations
@@ -29,6 +31,13 @@ from langchain_core.runnables.history import (
 
 from med_langchain_memory.stores import MedChatMessageHistory, StoreFactory
 
+from .summarizer import (
+    SummaryChain,
+    SummaryCompressor,
+    SummaryPolicy,
+    SummaryReport,
+    SummaryResult,
+)
 from .tenant import TenantContext
 from .token_budget import (
     TokenBudgetPolicy,
@@ -68,6 +77,12 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
             追加一层预算裁剪。
         token_counter: token 计数器实例或名称（``"heuristic"`` / ``"tiktoken"`` /
             tiktoken 编码表名）；``None`` 表示使用零依赖的启发式计数器。
+        summarizer: 摘要压缩策略；非空时 :meth:`summarize_context` 可把中间段旧消息
+            折叠成一条 system 摘要消息，:meth:`build_context` 会在时序裁剪与预算裁剪
+            之间插入该层。
+        summary_chain: 摘要链（满足 ``invoke({"messages": [...]})`` 契约，如
+            ``build_summary_prompt() | llm | StrOutputParser()``）；``None`` 时使用
+            零依赖的确定性摘要链。
 
     Raises:
         StoreNotFoundError: 通过本 Runnable 取用时 ``backend`` 未注册（在 ``invoke`` 时触发）。
@@ -91,6 +106,8 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         trim_policy: ContextWindowPolicy | None = None,
         token_budget: TokenBudgetPolicy | None = None,
         token_counter: TokenCounter | str | None = None,
+        summarizer: SummaryPolicy | None = None,
+        summary_chain: SummaryChain | None = None,
     ) -> None:
         options = dict(store_options or {})
         defaults = dict(default_namespace or {})
@@ -126,6 +143,8 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         self._trim_policy = trim_policy
         self._token_budget = token_budget
         self._token_counter = counter
+        self._summarizer = summarizer
+        self._summary_chain = summary_chain
 
     # ------------------------------------------------------------------ #
     # 内部构造助手
@@ -215,6 +234,16 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         """本 Runnable 使用的 token 计数器。"""
         return self._token_counter
 
+    @property
+    def summarizer(self) -> SummaryPolicy | None:
+        """注入的摘要压缩策略；``None`` 表示不做摘要压缩。"""
+        return self._summarizer
+
+    @property
+    def summary_chain(self) -> SummaryChain | None:
+        """注入的摘要链；``None`` 表示使用确定性摘要链。"""
+        return self._summary_chain
+
     # ------------------------------------------------------------------ #
     # 调用辅助
     # ------------------------------------------------------------------ #
@@ -237,16 +266,35 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
             return list(messages)
         return TimeWindowTrimmer(self._trim_policy).trim(messages, now_ms=now_ms)
 
+    def summarize_context(self, messages: Sequence[BaseMessage]) -> SummaryResult:
+        """按注入的摘要策略把中间段旧消息折叠为一条 system 摘要消息。
+
+        Args:
+            messages: 时序升序的消息序列。
+
+        Returns:
+            摘要压缩结果；未注入摘要策略时返回入参的等价副本，且
+            ``report.applied`` 为 ``False``。
+        """
+        if self._summarizer is None:
+            return SummaryResult(messages=list(messages), report=SummaryReport())
+        return SummaryCompressor(
+            self._summarizer,
+            chain=self._summary_chain,
+            counter=self._token_counter,
+        ).compress(messages)
+
     def build_context(
         self,
         messages: Sequence[BaseMessage],
         *,
         now_ms: int | None = None,
     ) -> TokenTrimResult:
-        """按「时序窗口 → Token 预算」两级流水线构建最终上下文。
+        """按「时序窗口 → 摘要压缩 → Token 预算」三级流水线构建最终上下文。
 
-        先应用 :attr:`trim_policy`（若注入）做时序滑动窗口裁剪，再应用
-        :attr:`token_budget`（若注入）做预算内贪心裁剪；两级均未注入时原样返回。
+        依次应用 :attr:`trim_policy`、:attr:`summarizer`、:attr:`token_budget`
+        （各自未注入时该级为空操作）；摘要消息是 system 消息，因此天然受预算裁剪的
+        系统槽位保护，不会被预算层丢弃。
 
         Args:
             messages: 时序升序的消息序列。
@@ -254,12 +302,28 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
 
         Returns:
             裁剪结果：``messages`` 为最终上下文，``report`` 为预算裁剪报告
-            （未注入预算策略时 ``report.applied`` 为 ``False``）。
+            （未注入预算策略时 ``report.applied`` 为 ``False``），``summary`` 为
+            摘要压缩报告（未注入摘要策略时为 ``None``）。
         """
         trimmed = self.trim_context(messages, now_ms=now_ms)
+        summarized = self.summarize_context(trimmed)
+        context = summarized.messages
+        summary_report = summarized.report if self._summarizer is not None else None
+
         if self._token_budget is None:
-            return TokenTrimResult(messages=trimmed, report=TokenTrimReport())
-        return TokenBudgetTrimmer(self._token_budget, counter=self._token_counter).trim(trimmed)
+            return TokenTrimResult(
+                messages=context,
+                report=TokenTrimReport(),
+                summary=summary_report,
+            )
+        budget_result = TokenBudgetTrimmer(self._token_budget, counter=self._token_counter).trim(
+            context
+        )
+        return TokenTrimResult(
+            messages=budget_result.messages,
+            report=budget_result.report,
+            summary=summary_report,
+        )
 
     @staticmethod
     def build_config(

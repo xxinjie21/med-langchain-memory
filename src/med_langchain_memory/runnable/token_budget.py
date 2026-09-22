@@ -25,7 +25,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -33,6 +33,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from med_langchain_memory.stores.base import MedChatMessageHistory
 
 from .trimmer import find_chief_complaint, is_system_message
+
+if TYPE_CHECKING:  # pragma: no cover - 仅供类型检查，避免与 summarizer 循环导入
+    from .summarizer import SummaryReport
 
 #: ``additional_kwargs`` 中承载消息已算好 token 数的键名（写入时为 0 表示未计算）。
 TOKEN_COUNT_KEY = "token_count"
@@ -308,10 +311,12 @@ class TokenTrimResult:
     Attributes:
         messages: 裁剪后的消息列表，保持原始时序升序。
         report: 本次裁剪的结构化报告。
+        summary: 上游摘要压缩（D27）的报告；未启用摘要压缩时为 ``None``。
     """
 
     messages: list[BaseMessage]
     report: TokenTrimReport
+    summary: SummaryReport | None = None
 
 
 def stored_token_count(message: BaseMessage) -> int | None:
