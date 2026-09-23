@@ -41,3 +41,11 @@ class IntegrityError(MedMemoryError):
 
 class AuditSinkError(MedMemoryError):
     """审计事件落盘失败（路径不可写、磁盘 IO 异常等）。"""
+
+
+class LockError(MedMemoryError):
+    """会话锁操作失败（锁客户端异常、租约丢失等基础设施层原因）。"""
+
+
+class LockAcquisitionError(LockError):
+    """在给定等待时间内未能获取会话锁（锁被其他持有者占用）。"""

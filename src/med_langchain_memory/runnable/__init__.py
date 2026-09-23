@@ -2,12 +2,25 @@
 
 当前提供基于存储工厂注入的会话历史增强 Runnable、多租户/科室命名空间隔离所需的
 身份上下文与越权守卫、时序滑动窗口裁剪策略、Token 预算裁剪（计数 + 预算内贪心
-保留 + 超限告警），以及长会话 LLM 摘要压缩（触发阈值 + 摘要写回 system 槽位 +
-被折叠区间标记）；后续迭代将叠加并发会话锁与读写降级等能力。
+保留 + 超限告警）、长会话 LLM 摘要压缩（触发阈值 + 摘要写回 system 槽位 +
+被折叠区间标记），以及并发会话锁（Redis SETNX 分布式锁 + 看门狗续期 + 本地线程锁
+降级）；后续迭代将叠加读写降级等能力。
 """
 
 from __future__ import annotations
 
+from .lock import (
+    DEFAULT_ACQUIRE_TIMEOUT_MS,
+    DEFAULT_LOCK_TTL_MS,
+    DEFAULT_RETRY_INTERVAL_MS,
+    LOCK_KEY_PREFIX,
+    WATCHDOG_TTL_DIVISOR,
+    LocalSessionLock,
+    LockPolicy,
+    RedisSessionLock,
+    SessionLock,
+    SessionLockManager,
+)
 from .med_history_runnable import MedRunnableWithMessageHistory
 from .summarizer import (
     COMPRESSED_COUNT_KEY,
@@ -65,18 +78,28 @@ __all__ = [
     "COMPRESSED_COUNT_KEY",
     "COMPRESSED_RANGE_KEY",
     "CREATED_AT_KEY",
+    "DEFAULT_ACQUIRE_TIMEOUT_MS",
+    "DEFAULT_LOCK_TTL_MS",
+    "DEFAULT_RETRY_INTERVAL_MS",
     "DEFAULT_SUMMARY_HEADER",
     "DEFAULT_TIKTOKEN_ENCODING",
+    "LOCK_KEY_PREFIX",
     "SUMMARY_FLAG_KEY",
     "SUMMARY_INSTRUCTION",
     "TIKTOKEN_ENCODINGS",
     "TOKEN_COUNT_KEY",
+    "WATCHDOG_TTL_DIVISOR",
     "ContextWindowPolicy",
     "ExtractiveSummaryChain",
     "HeuristicTokenCounter",
+    "LocalSessionLock",
+    "LockPolicy",
     "MedRunnableWithMessageHistory",
     "NAMESPACE_SEPARATOR",
+    "RedisSessionLock",
     "STORAGE_KEY_PREFIX",
+    "SessionLock",
+    "SessionLockManager",
     "SessionNamespace",
     "SummaryChain",
     "SummaryCompressor",

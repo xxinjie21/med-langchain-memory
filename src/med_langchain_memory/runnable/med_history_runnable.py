@@ -14,12 +14,16 @@ D25 起可选注入 :class:`~.trimmer.ContextWindowPolicy`，通过 :meth:`trim_
 由 :meth:`build_context` 按「时序窗口 → Token 预算」两级流水线产出最终上下文，
 并返回带告警的结构化报告；D27 起可再注入 :class:`~.summarizer.SummaryPolicy` 与
 摘要链，流水线升级为「时序窗口 → LLM 摘要压缩 → Token 预算」三级：中间段旧消息被
-折叠成一条带区间标记的 system 摘要消息后再做预算兜底裁剪。
+折叠成一条带区间标记的 system 摘要消息后再做预算兜底裁剪。D28 起可注入
+:class:`~.lock.LockPolicy`（可选 Redis 客户端），:meth:`invoke` 会在「读历史 →
+调模型 → 写历史」整段临界区外包一层会话锁，Redis 客户端缺失时自动降级为进程内
+本地锁；:meth:`session_lock` 供调用方跨多次调用自行圈定临界区。
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 from langchain_core.messages import BaseMessage
@@ -29,8 +33,10 @@ from langchain_core.runnables.history import (
     RunnableWithMessageHistory,
 )
 
+from med_langchain_memory.exceptions import LockError
 from med_langchain_memory.stores import MedChatMessageHistory, StoreFactory
 
+from .lock import LockPolicy, SessionLock, SessionLockManager
 from .summarizer import (
     SummaryChain,
     SummaryCompressor,
@@ -83,11 +89,15 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         summary_chain: 摘要链（满足 ``invoke({"messages": [...]})`` 契约，如
             ``build_summary_prompt() | llm | StrOutputParser()``）；``None`` 时使用
             零依赖的确定性摘要链。
+        lock_policy: 并发会话锁策略；非空时 :meth:`invoke` 会在临界区外自动加锁。
+        lock_client: Redis 客户端；``None`` 时锁降级为进程内本地锁。
+        lock_manager: 现成的锁管理器；给定后优先于 ``lock_policy`` / ``lock_client``。
 
     Raises:
         StoreNotFoundError: 通过本 Runnable 取用时 ``backend`` 未注册（在 ``invoke`` 时触发）。
         TenantIsolationError: 注入了 ``tenant_context`` 而调用方请求了越权命名空间时。
         ValueError: ``token_counter`` 为未知名称时。
+        LockAcquisitionError: 启用会话锁且等待超时仍未获取到锁时。
     """
 
     def __init__(
@@ -108,10 +118,16 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         token_counter: TokenCounter | str | None = None,
         summarizer: SummaryPolicy | None = None,
         summary_chain: SummaryChain | None = None,
+        lock_policy: LockPolicy | None = None,
+        lock_client: Any | None = None,
+        lock_manager: SessionLockManager | None = None,
     ) -> None:
         options = dict(store_options or {})
         defaults = dict(default_namespace or {})
         counter = resolve_token_counter(token_counter)
+        resolved_manager = lock_manager
+        if resolved_manager is None and lock_policy is not None:
+            resolved_manager = SessionLockManager(client=lock_client, policy=lock_policy)
 
         get_history = self._make_get_session_history(
             backend=backend,
@@ -145,6 +161,7 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         self._token_counter = counter
         self._summarizer = summarizer
         self._summary_chain = summary_chain
+        self._lock_manager = resolved_manager
 
     # ------------------------------------------------------------------ #
     # 内部构造助手
@@ -244,6 +261,11 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         """注入的摘要链；``None`` 表示使用确定性摘要链。"""
         return self._summary_chain
 
+    @property
+    def lock_manager(self) -> SessionLockManager | None:
+        """注入的并发会话锁管理器；``None`` 表示本 Runnable 不加锁。"""
+        return self._lock_manager
+
     # ------------------------------------------------------------------ #
     # 调用辅助
     # ------------------------------------------------------------------ #
@@ -325,6 +347,102 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
             summary=summary_report,
         )
 
+    def resolve_namespace(self, config: Mapping[str, Any] | None) -> tuple[str, str, str] | None:
+        """从调用配置中解析会话命名空间 ``(tenant_id, dept_id, session_id)``。
+
+        解析顺序与 ``get_session_history`` 闭包一致：配置项 → 构造时默认值 →
+        注入的租户身份；本方法只做解析，不做归属校验（校验仍由存储句柄闭包完成）。
+
+        Args:
+            config: LangChain 调用配置（``{"configurable": {...}}``）。
+
+        Returns:
+            三段式命名空间；缺少 ``session_id`` 或 ``config`` 非映射时返回 ``None``。
+        """
+        if not isinstance(config, Mapping):
+            return None
+        configurable = config.get("configurable")
+        if not isinstance(configurable, Mapping):
+            return None
+        session_id = configurable.get("session_id")
+        if not session_id or not isinstance(session_id, str):
+            return None
+        tenant_id = configurable.get("tenant_id") or ""
+        dept_id = configurable.get("dept_id") or ""
+        if self._tenant_context is not None:
+            tenant_id = tenant_id or self._tenant_context.tenant_id
+            dept_id = dept_id or self._tenant_context.dept_id
+        resolved_tenant = tenant_id or self._default_namespace.get("tenant_id", "")
+        resolved_dept = dept_id or self._default_namespace.get("dept_id", "")
+        return resolved_tenant, resolved_dept, session_id
+
+    @contextmanager
+    def session_lock(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str = "",
+        dept_id: str = "",
+        timeout_ms: int | None = None,
+    ) -> Iterator[SessionLock]:
+        """以会话锁圈定一段临界区（供调用方跨多次调用自行加锁）。
+
+        Args:
+            session_id: 会话 ID。
+            tenant_id: 医院/机构租户 ID；缺省回退到默认命名空间 / 注入的租户身份。
+            dept_id: 科室 ID；缺省回退规则同上。
+            timeout_ms: 获取锁的最长等待时长（毫秒）；``None`` 表示取策略默认值。
+
+        Yields:
+            已持有的锁实例。
+
+        Raises:
+            LockError: 本 Runnable 未启用会话锁时。
+            LockAcquisitionError: 等待超时仍未获取到锁时。
+        """
+        manager = self._lock_manager
+        if manager is None:
+            raise LockError("session locking is not enabled on this runnable")
+        resolved_tenant = tenant_id or self._default_namespace.get("tenant_id", "")
+        resolved_dept = dept_id or self._default_namespace.get("dept_id", "")
+        with manager.hold(
+            resolved_tenant,
+            resolved_dept,
+            session_id,
+            timeout_ms=timeout_ms,
+        ) as lock:
+            yield lock
+
+    def invoke(
+        self,
+        input: Any,
+        config: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """调用下游 Runnable；启用会话锁时在整段临界区外自动加锁。
+
+        加锁范围覆盖「取历史 → 下游调用 → 写回历史」全过程，避免并发问诊下的
+        上下文错乱；配置中缺少 ``session_id`` 时不加锁（由父类抛出参数缺失异常）。
+
+        Args:
+            input: 下游 Runnable 的输入。
+            config: 调用配置（须含 ``configurable.session_id`` 等命名空间字段）。
+            **kwargs: 透传给父类的额外关键字参数。
+
+        Returns:
+            下游 Runnable 的输出。
+
+        Raises:
+            LockAcquisitionError: 启用会话锁且等待超时仍未获取到锁时。
+        """
+        manager = self._lock_manager
+        namespace = self.resolve_namespace(config) if manager is not None else None
+        if manager is None or namespace is None:
+            return super().invoke(input, config, **kwargs)
+        tenant_id, dept_id, session_id = namespace
+        with manager.hold(tenant_id, dept_id, session_id):
+            return super().invoke(input, config, **kwargs)
+
     @staticmethod
     def build_config(
         session_id: str,
@@ -335,9 +453,9 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         """构造调用本 Runnable 所需的 ``config`` 字典。
 
         Args:
-        session_id: 会话 ID。
-        tenant_id: 医院/机构租户 ID。
-        dept_id: 科室 ID。
+            session_id: 会话 ID。
+            tenant_id: 医院/机构租户 ID。
+            dept_id: 科室 ID。
             patient_id: 患者 ID，缺省为空。
 
         Returns:
