@@ -17,7 +17,11 @@ D25 起可选注入 :class:`~.trimmer.ContextWindowPolicy`，通过 :meth:`trim_
 折叠成一条带区间标记的 system 摘要消息后再做预算兜底裁剪。D28 起可注入
 :class:`~.lock.LockPolicy`（可选 Redis 客户端），:meth:`invoke` 会在「读历史 →
 调模型 → 写历史」整段临界区外包一层会话锁，Redis 客户端缺失时自动降级为进程内
-本地锁；:meth:`session_lock` 供调用方跨多次调用自行圈定临界区。
+本地锁；:meth:`session_lock` 供调用方跨多次调用自行圈定临界区。D29 起可注入
+:class:`~.fallback.FallbackPolicy` 与后端专属构造参数，取用历史会得到
+:class:`~.fallback.FallbackHistory`：主后端读/写失败时按主备链降级到备后端，
+每个后端一份熔断器（失败阈值打开 + 恢复窗口半开探测），全部失败才抛
+``FallbackExhaustedError``。
 """
 
 from __future__ import annotations
@@ -36,6 +40,10 @@ from langchain_core.runnables.history import (
 from med_langchain_memory.exceptions import LockError
 from med_langchain_memory.stores import MedChatMessageHistory, StoreFactory
 
+from .fallback import (
+    FallbackHistoryResolver,
+    FallbackPolicy,
+)
 from .lock import LockPolicy, SessionLock, SessionLockManager
 from .summarizer import (
     SummaryChain,
@@ -92,12 +100,17 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         lock_policy: 并发会话锁策略；非空时 :meth:`invoke` 会在临界区外自动加锁。
         lock_client: Redis 客户端；``None`` 时锁降级为进程内本地锁。
         lock_manager: 现成的锁管理器；给定后优先于 ``lock_policy`` / ``lock_client``。
+        fallback_policy: 主备存储降级策略；非空时取用历史会得到 :class:`FallbackHistory`，
+            主后端读/写失败自动降级到备后端（每个后端一份熔断器）。
+        fallback_store_options: 后端名 → 该后端专属构造参数（在 ``store_options``
+            之上覆盖）；未配置的后端沿用 ``store_options``。仅 ``fallback_policy`` 非空时生效。
 
     Raises:
         StoreNotFoundError: 通过本 Runnable 取用时 ``backend`` 未注册（在 ``invoke`` 时触发）。
         TenantIsolationError: 注入了 ``tenant_context`` 而调用方请求了越权命名空间时。
         ValueError: ``token_counter`` 为未知名称时。
         LockAcquisitionError: 启用会话锁且等待超时仍未获取到锁时。
+        FallbackExhaustedError: 启用降级后主备后端全部失败时。
     """
 
     def __init__(
@@ -121,6 +134,8 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         lock_policy: LockPolicy | None = None,
         lock_client: Any | None = None,
         lock_manager: SessionLockManager | None = None,
+        fallback_policy: FallbackPolicy | None = None,
+        fallback_store_options: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         options = dict(store_options or {})
         defaults = dict(default_namespace or {})
@@ -128,6 +143,20 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         resolved_manager = lock_manager
         if resolved_manager is None and lock_policy is not None:
             resolved_manager = SessionLockManager(client=lock_client, policy=lock_policy)
+        resolved_fallback = fallback_policy
+        if resolved_fallback is None and fallback_store_options:
+            raise ValueError("fallback_store_options requires fallback_policy")
+        resolver = (
+            FallbackHistoryResolver(
+                policy=resolved_fallback,
+                store_factory=store_factory,
+                ttl_seconds=ttl_seconds,
+                store_options=fallback_store_options,
+                default_options=options,
+            )
+            if resolved_fallback is not None
+            else None
+        )
 
         get_history = self._make_get_session_history(
             backend=backend,
@@ -136,6 +165,7 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
             options=options,
             defaults=defaults,
             context=tenant_context,
+            resolver=resolver,
         )
         factory_config = self._build_history_factory_config()
 
@@ -162,6 +192,8 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         self._summarizer = summarizer
         self._summary_chain = summary_chain
         self._lock_manager = resolved_manager
+        self._fallback_policy = resolved_fallback
+        self._fallback_resolver = resolver
 
     # ------------------------------------------------------------------ #
     # 内部构造助手
@@ -175,6 +207,7 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
         options: Mapping[str, Any],
         defaults: Mapping[str, str],
         context: TenantContext | None,
+        resolver: FallbackHistoryResolver | None = None,
     ) -> GetSessionHistoryCallable:
         """构造 ``get_session_history`` 闭包。
 
@@ -185,6 +218,8 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
             options: 透传给存储实现的额外参数。
             defaults: 命名空间默认值。
             context: 调用方租户身份；``None`` 表示不做归属校验。
+            resolver: 降级句柄解析器；非空时按主备链返回 :class:`FallbackHistory`，
+                此时 ``backend`` / ``factory`` / ``options`` 不再直接使用。
 
         Returns:
             签名与 ``history_factory_config`` 字段一一对应的可调用对象，
@@ -206,6 +241,13 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
                 resolved_dept = resolved_dept or context.dept_id
                 context.assert_access(resolved_tenant, resolved_dept)
             resolved_patient = patient_id or defaults.get("patient_id", "")
+            if resolver is not None:
+                return resolver.resolve(  # type: ignore[return-value]
+                    session_id=session_id,
+                    tenant_id=resolved_tenant,
+                    dept_id=resolved_dept,
+                    patient_id=resolved_patient,
+                )
             return factory.create(
                 backend,
                 session_id=session_id,
@@ -265,6 +307,19 @@ class MedRunnableWithMessageHistory(RunnableWithMessageHistory):
     def lock_manager(self) -> SessionLockManager | None:
         """注入的并发会话锁管理器；``None`` 表示本 Runnable 不加锁。"""
         return self._lock_manager
+
+    @property
+    def fallback_policy(self) -> FallbackPolicy | None:
+        """注入的主备降级策略；``None`` 表示不启用读写降级。"""
+        return self._fallback_policy
+
+    @property
+    def fallback_resolver(self) -> FallbackHistoryResolver | None:
+        """主备降级句柄解析器；``None`` 表示不启用读写降级。
+
+        可用于读取各后端熔断器的实时状态（:meth:`FallbackHistoryResolver.breakers`）。
+        """
+        return self._fallback_resolver
 
     # ------------------------------------------------------------------ #
     # 调用辅助

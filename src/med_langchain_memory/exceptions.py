@@ -49,3 +49,16 @@ class LockError(MedMemoryError):
 
 class LockAcquisitionError(LockError):
     """在给定等待时间内未能获取会话锁（锁被其他持有者占用）。"""
+
+
+class FallbackExhaustedError(StorageError):
+    """主备存储全部不可用（实际失败或被熔断跳过）时抛出。
+
+    Attributes:
+        report: 触发本次异常的降级报告（``FallbackReport``），含每次尝试的
+            后端名与错误明细。为避免模块循环导入，此处以 ``Any`` 承载。
+    """
+
+    def __init__(self, message: str, *, report: object | None = None) -> None:
+        super().__init__(message)
+        self.report = report

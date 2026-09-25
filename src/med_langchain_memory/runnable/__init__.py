@@ -4,11 +4,27 @@
 身份上下文与越权守卫、时序滑动窗口裁剪策略、Token 预算裁剪（计数 + 预算内贪心
 保留 + 超限告警）、长会话 LLM 摘要压缩（触发阈值 + 摘要写回 system 槽位 +
 被折叠区间标记），以及并发会话锁（Redis SETNX 分布式锁 + 看门狗续期 + 本地线程锁
-降级）；后续迭代将叠加读写降级等能力。
+降级）与读写降级（主存储故障 → 备存储兜底 + 每后端一份简易熔断器：失败计数打开、
+恢复窗口半开探测、探测成功闭合）；后续迭代将叠加 API 层能力。
 """
 
 from __future__ import annotations
 
+from .fallback import (
+    DEFAULT_FAILURE_THRESHOLD,
+    DEFAULT_HALF_OPEN_MAX_CALLS,
+    DEFAULT_RECOVERY_TIMEOUT_MS,
+    DEFAULT_SUCCESS_THRESHOLD,
+    CircuitBreaker,
+    CircuitBreakerPolicy,
+    CircuitSnapshot,
+    CircuitState,
+    FallbackAttempt,
+    FallbackHistory,
+    FallbackHistoryResolver,
+    FallbackPolicy,
+    FallbackReport,
+)
 from .lock import (
     DEFAULT_ACQUIRE_TIMEOUT_MS,
     DEFAULT_LOCK_TTL_MS,
@@ -79,8 +95,12 @@ __all__ = [
     "COMPRESSED_RANGE_KEY",
     "CREATED_AT_KEY",
     "DEFAULT_ACQUIRE_TIMEOUT_MS",
+    "DEFAULT_FAILURE_THRESHOLD",
+    "DEFAULT_HALF_OPEN_MAX_CALLS",
     "DEFAULT_LOCK_TTL_MS",
+    "DEFAULT_RECOVERY_TIMEOUT_MS",
     "DEFAULT_RETRY_INTERVAL_MS",
+    "DEFAULT_SUCCESS_THRESHOLD",
     "DEFAULT_SUMMARY_HEADER",
     "DEFAULT_TIKTOKEN_ENCODING",
     "LOCK_KEY_PREFIX",
@@ -89,8 +109,17 @@ __all__ = [
     "TIKTOKEN_ENCODINGS",
     "TOKEN_COUNT_KEY",
     "WATCHDOG_TTL_DIVISOR",
+    "CircuitBreaker",
+    "CircuitBreakerPolicy",
+    "CircuitSnapshot",
+    "CircuitState",
     "ContextWindowPolicy",
     "ExtractiveSummaryChain",
+    "FallbackAttempt",
+    "FallbackHistory",
+    "FallbackHistoryResolver",
+    "FallbackPolicy",
+    "FallbackReport",
     "HeuristicTokenCounter",
     "LocalSessionLock",
     "LockPolicy",
