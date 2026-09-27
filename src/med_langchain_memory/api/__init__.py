@@ -8,6 +8,12 @@
 from __future__ import annotations
 
 from .app import configure_logging, create_app
+from .deps import (
+    SessionRepositoryDep,
+    SessionScopeDep,
+    get_session_repository,
+    resolve_session_scope,
+)
 from .errors import (
     DEFAULT_ERROR_STATUS,
     STATUS_MAP,
@@ -23,7 +29,14 @@ from .middleware import (
     REQUEST_ID_STATE_KEY,
     RequestLoggingMiddleware,
 )
-from .routers import HealthProbe, HealthResponse, build_health_router, run_probe
+from .routers import (
+    HealthProbe,
+    HealthResponse,
+    build_health_router,
+    build_sessions_router,
+    run_probe,
+)
+from .schemas import SessionCreateRequest, SessionListResponse, SessionResponse
 
 __all__ = [
     "DEFAULT_ERROR_STATUS",
@@ -35,12 +48,20 @@ __all__ = [
     "HealthProbe",
     "HealthResponse",
     "RequestLoggingMiddleware",
+    "SessionCreateRequest",
+    "SessionListResponse",
+    "SessionRepositoryDep",
+    "SessionResponse",
+    "SessionScopeDep",
     "build_health_router",
+    "build_sessions_router",
     "configure_logging",
     "create_app",
     "error_code_for",
+    "get_session_repository",
     "register_exception_handlers",
     "request_id_of",
+    "resolve_session_scope",
     "run_probe",
     "status_for",
 ]

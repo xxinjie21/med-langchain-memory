@@ -20,6 +20,14 @@ from .factory import StoreConfig, StoreFactory
 from .file_lock import FileLock
 from .file_store import FileFormat, FileMedHistory
 from .memory_store import InMemoryMedHistory
+from .session_repository import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
+    InMemorySessionRepository,
+    SessionRepository,
+    SessionScope,
+    validate_pagination,
+)
 
 with contextlib.suppress(ImportError):  # redis 为可选依赖，缺失时不注册 redis 后端
     from .redis_cluster_store import RedisClusterMedHistory, build_cluster_client
@@ -41,7 +49,9 @@ with contextlib.suppress(ImportError):  # elasticsearch 为可选依赖，缺失
 __all__ = [
     "ARCHIVE_INDEX_PREFIX",
     "ARCHIVE_TEMPLATE_NAME",
+    "DEFAULT_PAGE_SIZE",
     "DEFAULT_ROUTER",
+    "MAX_PAGE_SIZE",
     "MED_ROLE_KEY",
     "EsArchiveMedHistory",
     "ExpiryCallback",
@@ -49,9 +59,12 @@ __all__ = [
     "FileLock",
     "FileMedHistory",
     "InMemoryMedHistory",
+    "InMemorySessionRepository",
     "MedChatMessageHistory",
     "RedisClusterMedHistory",
     "RedisMedHistory",
+    "SessionRepository",
+    "SessionScope",
     "ShardRouter",
     "StoreConfig",
     "StoreFactory",
@@ -61,4 +74,5 @@ __all__ = [
     "monthly_index",
     "search_archive",
     "to_langchain_message",
+    "validate_pagination",
 ]
