@@ -7,7 +7,7 @@
 
     uvicorn med_langchain_memory.api.app:create_app --factory
 
-装配顺序（自外向内）：请求日志中间件 → 统一异常处理 → 健康检查路由 → 会话路由。
+装配顺序（自外向内）：请求日志中间件 → 统一异常处理 → 健康检查路由 → 会话路由 → 消息路由。
 """
 
 from __future__ import annotations
@@ -18,6 +18,11 @@ from collections.abc import Mapping
 from fastapi import FastAPI
 
 from med_langchain_memory.config import PACKAGE_LOGGER_NAME, MedMemorySettings
+from med_langchain_memory.privacy.policies import PolicyMasker
+from med_langchain_memory.stores.message_repository import (
+    InMemoryMessageRepository,
+    MessageRepository,
+)
 from med_langchain_memory.stores.session_repository import (
     InMemorySessionRepository,
     SessionRepository,
@@ -26,6 +31,7 @@ from med_langchain_memory.stores.session_repository import (
 from .errors import register_exception_handlers
 from .middleware import RequestLoggingMiddleware
 from .routers.health import HealthProbe, build_health_router
+from .routers.messages import build_messages_router
 from .routers.sessions import build_sessions_router
 
 
@@ -51,6 +57,8 @@ def create_app(
     *,
     health_probes: Mapping[str, HealthProbe] | None = None,
     session_repository: SessionRepository | None = None,
+    message_repository: MessageRepository | None = None,
+    masker: PolicyMasker | None = None,
 ) -> FastAPI:
     """构建 FastAPI 应用。
 
@@ -59,11 +67,16 @@ def create_app(
         health_probes: 就绪探针映射（名称 → 无参可调用），供后续迭代接入存储连通性检查。
         session_repository: 会话仓储实现；缺省使用进程内实现
             :class:`~med_langchain_memory.stores.session_repository.InMemorySessionRepository`。
+        message_repository: 消息仓储实现；缺省使用进程内实现
+            :class:`~med_langchain_memory.stores.message_repository.InMemoryMessageRepository`。
+        masker: 按租户配置的脱敏策略分发器；缺省使用内置规则作用于 ``content`` 字段的
+            :class:`~med_langchain_memory.privacy.policies.PolicyMasker`。
 
     Returns:
-        已挂载请求日志中间件、统一异常处理、健康检查与会话管理路由的 ``FastAPI`` 实例；
-        构造后的配置可从 ``app.state.settings`` 读取，会话仓储从
-        ``app.state.session_repository`` 读取。
+        已挂载请求日志中间件、统一异常处理、健康检查、会话管理与消息路由的 ``FastAPI`` 实例；
+        构造后的配置可从 ``app.state.settings`` 读取，仓储与脱敏分发器分别从
+        ``app.state.session_repository`` / ``app.state.message_repository`` / ``app.state.masker``
+        读取。
     """
     resolved = settings if settings is not None else MedMemorySettings()
     configure_logging(resolved.log_level)
@@ -79,9 +92,14 @@ def create_app(
     app.state.session_repository = (
         session_repository if session_repository is not None else InMemorySessionRepository()
     )
+    app.state.message_repository = (
+        message_repository if message_repository is not None else InMemoryMessageRepository()
+    )
+    app.state.masker = masker if masker is not None else PolicyMasker()
 
     app.add_middleware(RequestLoggingMiddleware, header_name=resolved.request_id_header)
     register_exception_handlers(app)
     app.include_router(build_health_router(resolved, health_probes))
     app.include_router(build_sessions_router())
+    app.include_router(build_messages_router())
     return app

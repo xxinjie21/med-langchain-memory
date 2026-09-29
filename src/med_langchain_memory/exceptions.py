@@ -39,6 +39,14 @@ class SessionNotFoundError(MedMemoryError):
     """目标会话在指定租户/科室命名空间下不存在。"""
 
 
+class SessionNotActiveError(StateTransitionError):
+    """会话不处于 ``ACTIVE`` 状态，拒绝写入（如已关闭/已归档/已删除）。
+
+    继承 :class:`StateTransitionError` 以复用其 409 语义，无需在 API 层
+    重复登记状态码映射。
+    """
+
+
 class IntegrityError(MedMemoryError):
     """数据完整性校验失败（如快照文件包校验和不匹配、内容损坏）。"""
 

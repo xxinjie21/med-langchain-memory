@@ -20,6 +20,7 @@ from .factory import StoreConfig, StoreFactory
 from .file_lock import FileLock
 from .file_store import FileFormat, FileMedHistory
 from .memory_store import InMemoryMedHistory
+from .message_repository import InMemoryMessageRepository, MessageRepository
 from .session_repository import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
@@ -59,8 +60,10 @@ __all__ = [
     "FileLock",
     "FileMedHistory",
     "InMemoryMedHistory",
+    "InMemoryMessageRepository",
     "InMemorySessionRepository",
     "MedChatMessageHistory",
+    "MessageRepository",
     "RedisClusterMedHistory",
     "RedisMedHistory",
     "SessionRepository",
