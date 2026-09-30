@@ -26,6 +26,7 @@ from .retention import (
 )
 from .snapshot import (
     DEFAULT_SCHEMA_VERSION,
+    PreparedSnapshot,
     SessionSnapshotPackage,
     SessionSnapshotter,
     SnapshotSummary,
@@ -53,6 +54,7 @@ __all__ = [
     "purge_expired_session",
     "soft_delete_session",
     "DEFAULT_SCHEMA_VERSION",
+    "PreparedSnapshot",
     "SessionSnapshotPackage",
     "SessionSnapshotter",
     "SnapshotSummary",

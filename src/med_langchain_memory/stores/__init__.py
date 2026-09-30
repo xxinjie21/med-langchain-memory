@@ -1,4 +1,4 @@
-"""存储适配层：统一的医疗会话历史抽象、工厂注册器与各存储引擎实现。
+"""存储适配层：统一的医疗会话历史抽象、工厂注册器、历史解析器与各存储引擎实现。
 
 导入本包即完成内置存储适配器的注册：``memory`` 与 ``file`` 始终可用；
 ``redis`` 依赖可选包 ``redis``、MySQL 分表路由依赖可选包 ``SQLAlchemy``、
@@ -19,6 +19,7 @@ from .base import (
 from .factory import StoreConfig, StoreFactory
 from .file_lock import FileLock
 from .file_store import FileFormat, FileMedHistory
+from .history_resolver import HistoryResolver, StoreFactoryHistoryResolver
 from .memory_store import InMemoryMedHistory
 from .message_repository import InMemoryMessageRepository, MessageRepository
 from .session_repository import (
@@ -59,6 +60,7 @@ __all__ = [
     "FileFormat",
     "FileLock",
     "FileMedHistory",
+    "HistoryResolver",
     "InMemoryMedHistory",
     "InMemoryMessageRepository",
     "InMemorySessionRepository",
@@ -71,6 +73,7 @@ __all__ = [
     "ShardRouter",
     "StoreConfig",
     "StoreFactory",
+    "StoreFactoryHistoryResolver",
     "build_cluster_client",
     "build_index_template",
     "from_langchain_message",

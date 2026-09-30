@@ -7,6 +7,8 @@
   取仓储实例，由应用工厂注入，便于测试替换为隔离实例或真实后端。
 * :func:`get_message_masker` —— 从 ``app.state.masker`` 取按租户配置的脱敏策略分发器，
   供消息查询端点按 ``mask`` 开关执行字段级正则脱敏。
+* :func:`get_history_resolver` —— 从 ``app.state.history_resolver`` 取会话历史解析器，
+  供管理端点（跨存储迁移 / 快照导出）按后端名构造存储句柄。
 本模块不含任何文本内容解析逻辑。
 """
 
@@ -18,6 +20,7 @@ from fastapi import Depends, Query, Request
 
 from med_langchain_memory.domain.message import IdStr
 from med_langchain_memory.privacy.policies import PolicyMasker
+from med_langchain_memory.stores.history_resolver import HistoryResolver
 from med_langchain_memory.stores.message_repository import MessageRepository
 from med_langchain_memory.stores.session_repository import (
     SessionRepository,
@@ -107,3 +110,25 @@ MessageRepositoryDep = Annotated[MessageRepository, Depends(get_message_reposito
 
 #: 脱敏策略分发器依赖别名。
 MessageMaskerDep = Annotated[PolicyMasker, Depends(get_message_masker)]
+
+
+def get_history_resolver(request: Request) -> HistoryResolver:
+    """从应用状态读取会话历史解析器。
+
+    Args:
+        request: 当前请求。
+
+    Returns:
+        应用工厂注入的 :class:`HistoryResolver`。
+
+    Raises:
+        RuntimeError: 应用未注入解析器（``app.state.history_resolver`` 缺失或类型不符）。
+    """
+    resolver: object = getattr(request.app.state, "history_resolver", None)
+    if not isinstance(resolver, HistoryResolver):
+        raise RuntimeError("history resolver is not configured on app.state")
+    return resolver
+
+
+#: 会话历史解析器依赖别名。
+HistoryResolverDep = Annotated[HistoryResolver, Depends(get_history_resolver)]

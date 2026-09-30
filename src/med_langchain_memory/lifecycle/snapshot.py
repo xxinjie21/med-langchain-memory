@@ -93,6 +93,40 @@ class SessionSnapshotPackage:
         return cls.from_bytes(Path(path).read_bytes())
 
 
+@dataclass(frozen=True)
+class PreparedSnapshot:
+    """已序列化但尚未落盘的会话快照。
+
+    供「不写磁盘」的调用方使用（如管理接口把快照内联返回给调用方），
+    同时携带自描述摘要信息，避免调用方二次读取存储。
+
+    Attributes:
+        package: 带校验和的快照文件包。
+        session_key: 会话统一存储键。
+        message_count: 快照内实际包含的消息条数。
+        schema_version: 文件包 schema 版本。
+    """
+
+    package: SessionSnapshotPackage
+    session_key: str
+    message_count: int
+    schema_version: str
+
+    def to_bytes(self) -> bytes:
+        """返回文件包字节（含尾部 32 字节 SHA-256 校验和）。"""
+        return self.package.to_bytes()
+
+    @property
+    def size_bytes(self) -> int:
+        """文件包字节数。"""
+        return len(self.to_bytes())
+
+    @property
+    def sha256(self) -> str:
+        """文件包的 SHA-256 十六进制摘要。"""
+        return hashlib.sha256(self.to_bytes()).hexdigest()
+
+
 @dataclass
 class SnapshotSummary:
     """单次导出/恢复操作的摘要结果。
@@ -123,6 +157,33 @@ class SessionSnapshotter:
         """
         self._ser = serializer or ProtobufSerializer()
 
+    def prepare_snapshot(
+        self,
+        history: MedChatMessageHistory,
+        *,
+        schema_version: str = DEFAULT_SCHEMA_VERSION,
+    ) -> PreparedSnapshot:
+        """把会话元数据与全量消息序列化为快照文件包（**不落盘**）。
+
+        导出前以实际消息数校正元数据计数，保证快照内自洽。
+
+        Args:
+            history: 源会话历史（任意已注册后端）。
+            schema_version: 文件包 schema 版本标记。
+
+        Returns:
+            已序列化的 :class:`PreparedSnapshot`。
+        """
+        messages = history.get_med_messages()
+        meta = history.session_meta.model_copy(update={"message_count": len(messages)})
+        payload = self._ser.serialize_snapshot(meta, messages, schema_version)
+        return PreparedSnapshot(
+            package=SessionSnapshotPackage(schema_version=schema_version, payload=payload),
+            session_key=meta.storage_key,
+            message_count=len(messages),
+            schema_version=schema_version,
+        )
+
     def export_session(
         self,
         history: MedChatMessageHistory,
@@ -140,16 +201,12 @@ class SessionSnapshotter:
         Returns:
             导出摘要；``verified`` 恒为 ``None``。
         """
-        meta = history.session_meta
-        messages = history.get_med_messages()
-        # 导出前以实际消息数校正计数，保证快照内自洽。
-        meta = meta.model_copy(update={"message_count": len(messages)})
-        payload = self._ser.serialize_snapshot(meta, messages, schema_version)
-        SessionSnapshotPackage(schema_version=schema_version, payload=payload).save(path)
+        prepared = self.prepare_snapshot(history, schema_version=schema_version)
+        prepared.package.save(path)
         return SnapshotSummary(
-            session_key=meta.storage_key,
-            message_count=len(messages),
-            schema_version=schema_version,
+            session_key=prepared.session_key,
+            message_count=prepared.message_count,
+            schema_version=prepared.schema_version,
             path=str(path),
             verified=None,
         )

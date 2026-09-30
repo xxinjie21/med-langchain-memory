@@ -49,6 +49,13 @@ def test_package_from_bytes_rejects_bad_magic():
         SessionSnapshotPackage.from_bytes(bad)
 
 
+def test_package_from_bytes_rejects_truncated_header():
+    # 魔数正确但声明了超长 schema 版本，头部越界 -> 拒绝解析
+    truncated = b"MEDSNAP1" + bytes([255]) + b"1" + b"\x00" * 40
+    with pytest.raises(SerializationError):
+        SessionSnapshotPackage.from_bytes(truncated)
+
+
 def test_package_detects_checksum_tamper():
     pkg = SessionSnapshotPackage(schema_version="1", payload=b"hello")
     raw = bytearray(pkg.to_bytes())

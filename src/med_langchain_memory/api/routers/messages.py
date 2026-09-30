@@ -37,9 +37,7 @@ from med_langchain_memory.api.cursor import (
     paginate,
 )
 from med_langchain_memory.domain.message import IdStr, MedMessage
-from med_langchain_memory.domain.session import SessionMeta, SessionStatus
-from med_langchain_memory.exceptions import SessionNotActiveError, SessionNotFoundError
-from med_langchain_memory.stores.session_repository import SessionRepository, SessionScope
+from med_langchain_memory.stores.session_repository import SessionScope
 
 from ..deps import MessageMaskerDep, MessageRepositoryDep, SessionRepositoryDep, SessionScopeDep
 from ..schemas import (
@@ -48,78 +46,11 @@ from ..schemas import (
     MessageListResponse,
     MessageResponse,
 )
+from ..session_guards import require_active_session, require_visible_session
 
 _NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
     status.HTTP_404_NOT_FOUND: {"description": "会话不存在"}
 }
-
-
-def _require(repository: SessionRepository, scope: SessionScope, session_id: str) -> SessionMeta:
-    """读取会话元数据，不存在时抛出 404 对应的领域异常。
-
-    Args:
-        repository: 会话仓储。
-        scope: 命名空间坐标。
-        session_id: 会话 ID。
-
-    Returns:
-        命中的会话元数据。
-
-    Raises:
-        SessionNotFoundError: 指定命名空间下不存在该会话。
-    """
-    meta = repository.get(scope, session_id)
-    if meta is None:
-        raise SessionNotFoundError(f"session not found: {scope.storage_key(session_id)}")
-    return meta
-
-
-def _require_visible(
-    repository: SessionRepository, scope: SessionScope, session_id: str
-) -> SessionMeta:
-    """读取会话，要求其对普通查询可见（已软删除的会话按 404 处理）。
-
-    Args:
-        repository: 会话仓储。
-        scope: 命名空间坐标。
-        session_id: 会话 ID。
-
-    Returns:
-        命中的会话元数据。
-
-    Raises:
-        SessionNotFoundError: 会话不存在或已处于 ``DELETED`` 状态时。
-    """
-    meta = _require(repository, scope, session_id)
-    if meta.status is SessionStatus.DELETED:
-        raise SessionNotFoundError(f"session not found: {scope.storage_key(session_id)}")
-    return meta
-
-
-def _require_active(
-    repository: SessionRepository, scope: SessionScope, session_id: str
-) -> SessionMeta:
-    """读取会话，要求其处于 ``ACTIVE`` 状态（否则拒绝写入）。
-
-    Args:
-        repository: 会话仓储。
-        scope: 命名空间坐标。
-        session_id: 会话 ID。
-
-    Returns:
-        命中的会话元数据。
-
-    Raises:
-        SessionNotFoundError: 会话不存在时。
-        SessionNotActiveError: 会话不处于 ``ACTIVE`` 状态时。
-    """
-    meta = _require(repository, scope, session_id)
-    if meta.status is not SessionStatus.ACTIVE:
-        raise SessionNotActiveError(
-            f"cannot append messages to {scope.storage_key(session_id)}: "
-            f"status is {meta.status.value}, expected {SessionStatus.ACTIVE.value}"
-        )
-    return meta
 
 
 def _build_messages(
@@ -188,7 +119,7 @@ def build_messages_router() -> APIRouter:
         repository: MessageRepositoryDep,
     ) -> MessageAppendResponse:
         """向会话追加消息并同步刷新会话的消息计数。"""
-        meta = _require_active(sessions, scope, session_id)
+        meta = require_active_session(sessions, scope, session_id)
         batch = _build_messages(
             payload, scope=scope, session_id=session_id, patient_id=meta.patient_id
         )
@@ -218,7 +149,7 @@ def build_messages_router() -> APIRouter:
         mask: Annotated[bool, Query(description="是否对返回内容做字段级脱敏")] = True,
     ) -> MessageListResponse:
         """按时序升序游标分页返回消息，可按开关执行字段级脱敏。"""
-        _require_visible(sessions, scope, session_id)
+        require_visible_session(sessions, scope, session_id)
         page, next_cursor = paginate(
             repository.read(scope, session_id),
             limit=limit,

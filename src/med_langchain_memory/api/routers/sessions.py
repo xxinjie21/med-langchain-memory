@@ -31,7 +31,6 @@ from fastapi import APIRouter, Query, status
 
 from med_langchain_memory.domain.message import IdStr
 from med_langchain_memory.domain.session import SessionMeta, SessionStatus
-from med_langchain_memory.exceptions import SessionNotFoundError
 from med_langchain_memory.stores.session_repository import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
@@ -41,26 +40,7 @@ from med_langchain_memory.stores.session_repository import (
 
 from ..deps import SessionRepositoryDep, SessionScopeDep
 from ..schemas import SessionCreateRequest, SessionListResponse, SessionResponse
-
-
-def _require(repository: SessionRepository, scope: SessionScope, session_id: str) -> SessionMeta:
-    """读取会话元数据，不存在时抛出 404 对应的领域异常。
-
-    Args:
-        repository: 会话仓储。
-        scope: 命名空间坐标。
-        session_id: 会话 ID。
-
-    Returns:
-        命中的会话元数据。
-
-    Raises:
-        SessionNotFoundError: 指定命名空间下不存在该会话。
-    """
-    meta = repository.get(scope, session_id)
-    if meta is None:
-        raise SessionNotFoundError(f"session not found: {scope.storage_key(session_id)}")
-    return meta
+from ..session_guards import require_session
 
 
 def _transition(
@@ -84,7 +64,7 @@ def _transition(
         SessionNotFoundError: 会话不存在时。
         StateTransitionError: 当前状态不允许流转到 ``target`` 时。
     """
-    meta = _require(repository, scope, session_id)
+    meta = require_session(repository, scope, session_id)
     return repository.update(meta.transition_to(target))
 
 
@@ -149,7 +129,7 @@ def build_sessions_router() -> APIRouter:
         repository: SessionRepositoryDep,
     ) -> SessionResponse:
         """按会话 ID 查询详情。"""
-        return SessionResponse.from_meta(_require(repository, scope, session_id))
+        return SessionResponse.from_meta(require_session(repository, scope, session_id))
 
     @router.post(
         "/{session_id}/close",
