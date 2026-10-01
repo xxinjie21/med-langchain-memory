@@ -1,8 +1,12 @@
-"""API 依赖注入：会话命名空间解析、会话仓储与消息仓储/脱敏引擎获取。
+"""API 依赖注入：会话命名空间解析（含 API Key 鉴权）、仓储与脱敏引擎获取。
 
 * :func:`resolve_session_scope` —— 从查询参数 ``tenant_id`` / ``dept_id`` 构造
-  :class:`SessionScope`，所有会话端点都要求显式声明命名空间，杜绝跨租户误查；
-  后续迭代接入 API Key 后，只需替换本函数即可把命名空间来源改为密钥 scope。
+  :class:`SessionScope`。**鉴权开关由应用状态决定**：``app.state.authenticator``
+  为 ``None`` 时（未配置密钥，如本地开发）沿用「查询参数即命名空间」的历史行为；
+  配置了认证器时则强制要求请求头携带 API Key，认证通过后由
+  :func:`~med_langchain_memory.api.auth.authorize_scope` 校验租户与科室白名单，
+  失败分别返回 401 / 403。
+* :func:`authenticator_of` —— 从 ``app.state`` 取认证器；未配置或类型不符时返回 ``None``。
 * :func:`get_session_repository` / :func:`get_message_repository` —— 从 ``app.state``
   取仓储实例，由应用工厂注入，便于测试替换为隔离实例或真实后端。
 * :func:`get_message_masker` —— 从 ``app.state.masker`` 取按租户配置的脱敏策略分发器，
@@ -27,21 +31,47 @@ from med_langchain_memory.stores.session_repository import (
     SessionScope,
 )
 
+from .auth import ApiKeyAuthenticator, authorize_scope
+
+
+def authenticator_of(request: Request) -> ApiKeyAuthenticator | None:
+    """读取应用状态中的 API Key 认证器。
+
+    Args:
+        request: 当前请求。
+
+    Returns:
+        已配置的 :class:`ApiKeyAuthenticator`；未配置或类型不符时返回 ``None``
+        （表示该应用未启用鉴权）。
+    """
+    authenticator: object = getattr(request.app.state, "authenticator", None)
+    return authenticator if isinstance(authenticator, ApiKeyAuthenticator) else None
+
 
 def resolve_session_scope(
+    request: Request,
     tenant_id: Annotated[IdStr, Query(description="医院/机构租户 ID")],
     dept_id: Annotated[IdStr, Query(description="科室 ID")],
 ) -> SessionScope:
-    """由查询参数构造会话命名空间。
+    """构造并鉴权会话命名空间。
 
     Args:
+        request: 当前请求（用于读取应用状态中的认证器与请求头）。
         tenant_id: 医院/机构租户 ID。
         dept_id: 科室 ID。
 
     Returns:
         会话命名空间坐标 :class:`SessionScope`。
+
+    Raises:
+        AuthenticationError: 应用已启用鉴权但请求未携带有效 API Key 时（401）。
+        AuthorizationError: 密钥与请求声明的租户不一致，或科室不在白名单内时（403）。
     """
-    return SessionScope(tenant_id=tenant_id, dept_id=dept_id)
+    authenticator = authenticator_of(request)
+    if authenticator is None:
+        return SessionScope(tenant_id=tenant_id, dept_id=dept_id)
+    principal = authenticator.authenticate(request.headers.get(authenticator.header_name))
+    return authorize_scope(principal, tenant_id=tenant_id, dept_id=dept_id)
 
 
 def get_session_repository(request: Request) -> SessionRepository:

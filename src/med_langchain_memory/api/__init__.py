@@ -1,7 +1,7 @@
 """FastAPI 接口层。
 
-面向医院侧调用方的 HTTP 接入层：应用工厂、请求日志中间件、统一异常处理、健康检查、
-会话管理、消息与管理端点（归档统计 / 跨存储迁移 / 快照导出）。
+面向医院侧调用方的 HTTP 接入层：应用工厂、请求日志中间件、统一异常处理、API Key 鉴权、
+健康检查、会话管理、消息与管理端点（归档统计 / 跨存储迁移 / 快照导出）。
 本层是**可选依赖**（``pip install med-langchain-memory[api]``），因此不在包顶层
 ``med_langchain_memory/__init__.py`` 中导入，避免未装 FastAPI 时整包不可用。
 """
@@ -9,6 +9,16 @@
 from __future__ import annotations
 
 from .app import configure_logging, create_app
+from .auth import (
+    DEFAULT_API_KEY_HEADER,
+    WILDCARD_DEPT,
+    ApiKeyAuthenticator,
+    ApiKeyRecord,
+    AuthPrincipal,
+    authorize_scope,
+    dept_allowed,
+    hash_api_key,
+)
 from .cursor import (
     DEFAULT_MESSAGE_PAGE_SIZE,
     MAX_MESSAGE_PAGE_SIZE,
@@ -23,6 +33,7 @@ from .deps import (
     MessageRepositoryDep,
     SessionRepositoryDep,
     SessionScopeDep,
+    authenticator_of,
     get_history_resolver,
     get_message_masker,
     get_message_repository,
@@ -72,6 +83,7 @@ from .schemas import (
 )
 
 __all__ = [
+    "DEFAULT_API_KEY_HEADER",
     "DEFAULT_ERROR_STATUS",
     "DEFAULT_MESSAGE_PAGE_SIZE",
     "DEFAULT_REQUEST_ID_HEADER",
@@ -81,7 +93,11 @@ __all__ = [
     "PROCESS_TIME_HEADER",
     "REQUEST_ID_STATE_KEY",
     "STATUS_MAP",
+    "WILDCARD_DEPT",
     "AdminStatsResponse",
+    "ApiKeyAuthenticator",
+    "ApiKeyRecord",
+    "AuthPrincipal",
     "ErrorResponse",
     "HealthProbe",
     "HealthResponse",
@@ -104,6 +120,8 @@ __all__ = [
     "SessionScopeDep",
     "SnapshotRequest",
     "SnapshotResponse",
+    "authenticator_of",
+    "authorize_scope",
     "build_admin_router",
     "build_health_router",
     "build_messages_router",
@@ -111,12 +129,14 @@ __all__ = [
     "configure_logging",
     "create_app",
     "decode_cursor",
+    "dept_allowed",
     "encode_cursor",
     "error_code_for",
     "get_history_resolver",
     "get_message_masker",
     "get_message_repository",
     "get_session_repository",
+    "hash_api_key",
     "paginate",
     "register_exception_handlers",
     "request_id_of",

@@ -8,7 +8,9 @@
     uvicorn med_langchain_memory.api.app:create_app --factory
 
 装配顺序（自外向内）：请求日志中间件 → 统一异常处理 → 健康检查路由 → 会话路由 → 消息路由
-→ 管理路由。
+→ 管理路由。会话 / 消息 / 管理三类路由共用 :func:`~med_langchain_memory.api.deps.resolve_session_scope`
+依赖，因此传入 ``authenticator`` 即整体开启 API Key 鉴权（401/403），不传则保持
+「查询参数即命名空间」的免鉴权行为；健康检查不受鉴权影响。
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from med_langchain_memory.stores.session_repository import (
     SessionRepository,
 )
 
+from .auth import ApiKeyAuthenticator
 from .errors import register_exception_handlers
 from .middleware import RequestLoggingMiddleware
 from .routers.admin import build_admin_router
@@ -66,6 +69,7 @@ def create_app(
     message_repository: MessageRepository | None = None,
     masker: PolicyMasker | None = None,
     history_resolver: HistoryResolver | None = None,
+    authenticator: ApiKeyAuthenticator | None = None,
 ) -> FastAPI:
     """构建 FastAPI 应用。
 
@@ -81,12 +85,16 @@ def create_app(
         history_resolver: 会话历史解析器；缺省使用委托存储工厂的
             :class:`~med_langchain_memory.stores.history_resolver.StoreFactoryHistoryResolver`，
             供管理端点按后端名构造存储句柄。
+        authenticator: API Key 认证器；缺省为 ``None`` 表示**不启用鉴权**（本地开发 /
+            内网部署）。传入实例后，会话、消息与管理端点的命名空间一律改为「先认证、
+            再按密钥的租户与科室白名单授权」，缺失或无效密钥返回 401，越权返回 403。
 
     Returns:
         已挂载请求日志中间件、统一异常处理、健康检查、会话管理、消息与管理路由的
-        ``FastAPI`` 实例；构造后的配置可从 ``app.state.settings`` 读取，仓储、脱敏分发器与
-        历史解析器分别从 ``app.state.session_repository`` / ``app.state.message_repository`` /
-        ``app.state.masker`` / ``app.state.history_resolver`` 读取。
+        ``FastAPI`` 实例；构造后的配置可从 ``app.state.settings`` 读取，仓储、脱敏分发器、
+        历史解析器与认证器分别从 ``app.state.session_repository`` /
+        ``app.state.message_repository`` / ``app.state.masker`` /
+        ``app.state.history_resolver`` / ``app.state.authenticator`` 读取。
     """
     resolved = settings if settings is not None else MedMemorySettings()
     configure_logging(resolved.log_level)
@@ -109,6 +117,7 @@ def create_app(
     app.state.history_resolver = (
         history_resolver if history_resolver is not None else StoreFactoryHistoryResolver()
     )
+    app.state.authenticator = authenticator
 
     app.add_middleware(RequestLoggingMiddleware, header_name=resolved.request_id_header)
     register_exception_handlers(app)

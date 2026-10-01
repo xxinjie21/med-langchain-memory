@@ -27,6 +27,14 @@ class TenantIsolationError(MedMemoryError):
     """跨租户 / 跨科室越权访问会话数据时抛出。"""
 
 
+class AuthenticationError(MedMemoryError):
+    """API Key 缺失、无效或已停用，请求未通过身份认证（对应 HTTP 401）。"""
+
+
+class AuthorizationError(MedMemoryError):
+    """身份已认证但无权访问目标租户 / 科室资源（对应 HTTP 403）。"""
+
+
 class StoreRegistrationError(MedMemoryError):
     """存储适配器注册失败（名称非法、重复注册或类型不合法）。"""
 

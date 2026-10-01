@@ -30,6 +30,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from med_langchain_memory.config import PACKAGE_LOGGER_NAME
 from med_langchain_memory.exceptions import (
     AuditSinkError,
+    AuthenticationError,
+    AuthorizationError,
     FallbackExhaustedError,
     IntegrityError,
     LockAcquisitionError,
@@ -55,6 +57,8 @@ DEFAULT_ERROR_STATUS: Final = 500
 #: ``LockError``、``FallbackExhaustedError`` 先于 ``StorageError``）。
 STATUS_MAP: Final[tuple[tuple[type[MedMemoryError], int], ...]] = (
     (ValidationError, 400),
+    (AuthenticationError, 401),
+    (AuthorizationError, 403),
     (TenantIsolationError, 403),
     (StoreNotFoundError, 404),
     (SessionNotFoundError, 404),
