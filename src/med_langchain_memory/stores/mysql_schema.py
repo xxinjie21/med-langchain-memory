@@ -5,13 +5,21 @@
 
 * :data:`SESSION_TABLE` —— 会话元数据表 ``med_session``（一会话一行）；
 * :data:`MESSAGE_TABLES` —— 消息分表 ``med_message_00`` ~ ``med_message_15``，共
-  :data:`SHARD_COUNT` 张同构表，字段对齐 ROADMAP《对外存储规范》与 protobuf ``MedMessage``；
+  :data:`SHARD_COUNT` 张同构表，字段对齐 ROADMAP《对外存储规范》与 protobuf ``MedMessage``，
+  并额外携带一列**存储层自增序号** ``ordinal``（见下）；
 * :data:`SCHEMA_VERSION_TABLE` —— 迁移基线版本表 ``med_schema_version``，
   用极简的"版本号 + 应用时间"两列记录已落地的模式版本（不引入额外迁移框架依赖）。
 
 16 张分表在此仅做**结构定义**，``session_id -> shard`` 的一致性 hash 路由属于 D14。
 所有表均可用 :func:`render_ddl` 渲染为可直接执行的 SQL 脚本，或用 :func:`create_all`
 在给定 ``Engine`` 上建表（测试用 SQLite 内存库亦可）。
+
+``ordinal`` 列不属于 :class:`~med_langchain_memory.domain.message.MedMessage` 的字段集，
+而是**存储层为了保序而附加的会话内单调递增序号**：``message_id`` 为 UUIDv7，同毫秒内
+的随机位会打乱插入顺序，仅按 ``created_at`` 排序无法还原写入顺序；因此由
+:mod:`med_langchain_memory.stores.mysql_store` 在写入时分配 ``ordinal``，
+读取按 ``(created_at, ordinal)`` 排序，与内存 / 文件 / Redis / ES 后端语义保持一致。
+:func:`message_to_row` 因此接受一个可选的 ``ordinal`` 参数（缺省 ``0``）。
 
 本模块只做结构映射与字段搬运，不含任何文本内容解析逻辑。
 """
@@ -106,8 +114,9 @@ def _build_message_table(shard: int) -> Table:
         Column("token_count", Integer, nullable=False, server_default=text("0")),
         Column("masked", Boolean, nullable=False, server_default=text("0")),
         Column("created_at", BigInteger, nullable=False),
+        Column("ordinal", BigInteger, nullable=False, server_default=text("0")),
         Column("metadata", JSON, nullable=False),
-        Index(None, "session_id", "created_at"),
+        Index(None, "session_id", "created_at", "ordinal"),
         Index(None, "tenant_id", "dept_id"),
         mysql_engine="InnoDB",
         mysql_charset="utf8mb4",
@@ -177,15 +186,22 @@ def all_tables() -> list[Table]:
 # ---------------------------------------------------------------------- #
 # 领域模型 <-> 数据行
 # ---------------------------------------------------------------------- #
-def message_to_row(message: MedMessage) -> dict[str, Any]:
+def message_to_row(message: MedMessage, ordinal: int = 0) -> dict[str, Any]:
     """将医疗消息转换为可直接 ``insert()`` 的行字典。
 
     Args:
         message: 待落库的医疗消息。
+        ordinal: 会话内单调递增的写入序号（由存储层分配），用于同毫秒消息保序；
+            缺省 ``0``。
 
     Returns:
         键与消息分表列名一一对应的字典。
+
+    Raises:
+        ValidationError: ``ordinal`` 为负数时。
     """
+    if ordinal < 0:
+        raise ValidationError(f"ordinal must be a non-negative integer, got {ordinal}")
     return {
         "message_id": message.message_id,
         "session_id": message.session_id,
@@ -197,6 +213,7 @@ def message_to_row(message: MedMessage) -> dict[str, Any]:
         "token_count": message.token_count,
         "masked": message.masked,
         "created_at": message.created_at,
+        "ordinal": ordinal,
         "metadata": dict(message.metadata),
     }
 

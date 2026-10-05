@@ -29,7 +29,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| 多存储适配 | 五种已注册后端（内存 / 文件 / Redis 单机 / Redis 集群 / ES 归档）+ MySQL 16 张分表结构定义与 hash 路由，装饰器注册、热插拔 |
+| 多存储适配 | 六种已注册后端（内存 / 文件 / Redis 单机 / Redis 集群 / MySQL 16 张分表 / ES 归档），装饰器注册、热插拔 |
 | 统一序列化协议 | Protobuf 二进制 + 冻结字段号，跨语言（Java / Go / Python）互通 |
 | 会话生命周期 | TTL 自动归档、软删除与合规保留期、快照备份/恢复、跨存储迁移（断点续传） |
 | 上下文工程 | 时序窗口裁剪 → LLM 摘要压缩 → Token 预算裁剪，三级可组合流水线 |
@@ -66,17 +66,19 @@
 | `file` | `FileMedHistory` | 本地文件，支持 JSONL 追加与 protobuf 二进制两种模式 + 跨进程文件锁 | 无 |
 | `redis` | `RedisMedHistory` | Redis 单机热会话存储，pipeline 批量写 + 原生 TTL 滑动续期 | `[redis]` |
 | `redis-cluster` | `RedisClusterMedHistory` | Redis 集群，`{session_id}` hash tag 保证同会话同 slot | `[redis]` |
+| `mysql` | `MySQLMedHistory` | MySQL 16 张同构分表，`crc32(session_id) % 16` 一致性 hash 路由 + `med_session` 会话行 upsert | `[mysql]` |
 | `elasticsearch` | `EsArchiveMedHistory` | 冷归档，按月滚动索引 + bulk 批量写入 | `[es]` |
 
 ```python
 from med_langchain_memory.stores import StoreFactory
 
-StoreFactory.available()  # 例：['elasticsearch', 'file', 'memory', 'redis', 'redis-cluster']
+StoreFactory.available()  # 例：['elasticsearch', 'file', 'memory', 'mysql', 'redis', 'redis-cluster']
 ```
 
-> **MySQL 分表**当前提供**结构定义与 hash 路由**（`stores/mysql_schema.py` 的 16 张同构分表
-> DDL、`stores/mysql_shard_router.py` 的 `crc32(session_id) % 16` 路由），
-> 尚未注册为独立的 history 适配器；分表列定义见 [存储规范 §7.2](./docs/storage-spec.md)。
+> **MySQL 分表**：写入按 `crc32(session_id) % 16` 路由到唯一分表，同一次
+> `add_med_messages` 的批量消息单次 `executemany` 落库；存储层为每条消息分配会话内
+> 单调递增的 `ordinal`，读取按 `(created_at, ordinal)` 排序，保证同毫秒消息的写入顺序
+> 与其余后端一致。表结构与列定义见 [存储规范 §7.2](./docs/storage-spec.md)。
 
 ---
 
@@ -127,7 +129,7 @@ src/med_langchain_memory/
 ```bash
 pip install med-langchain-memory                  # 核心（memory / file 后端）
 pip install "med-langchain-memory[redis]"         # + Redis 单机 / 集群
-pip install "med-langchain-memory[mysql]"         # + MySQL 分表
+pip install "med-langchain-memory[mysql]"         # + MySQL 分表（另需 DBAPI 驱动，如 pymysql）
 pip install "med-langchain-memory[es]"            # + Elasticsearch 归档
 pip install "med-langchain-memory[api]"           # + FastAPI 接口层
 pip install "med-langchain-memory[token]"         # + tiktoken Token 计数

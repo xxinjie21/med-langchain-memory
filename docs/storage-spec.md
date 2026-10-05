@@ -203,7 +203,7 @@
 
 **分表路由**：`med_message_{crc32(session_id) % 16}`，表名编号补零到两位（`00`…`15`）。
 
-分表列定义（结构对齐 `MedMessage`）：
+分表列定义（结构对齐 `MedMessage`，外加存储层保序列 `ordinal`）：
 
 ```sql
 CREATE TABLE med_message_00 (
@@ -217,12 +217,18 @@ CREATE TABLE med_message_00 (
     token_count INT          NOT NULL DEFAULT 0,
     masked      BOOL         NOT NULL DEFAULT 0,
     created_at  BIGINT       NOT NULL,
+    ordinal     BIGINT       NOT NULL DEFAULT 0,  -- 会话内单调递增写入序号
     metadata    JSON         NOT NULL,
     PRIMARY KEY (message_id),
-    INDEX (session_id, created_at),   -- 会话时序扫描
-    INDEX (tenant_id, dept_id)        -- 租户/科室维度统计
+    INDEX (session_id, created_at, ordinal),   -- 会话时序扫描（保序）
+    INDEX (tenant_id, dept_id)                 -- 租户/科室维度统计
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
+
+`ordinal` **不属于** `MedMessage` 字段集，是存储层为保序附加的列：`message_id` 为 UUIDv7，
+同毫秒内随机，仅按 `created_at` 排序无法还原写入顺序，因此由写入方按
+「会话内最大 `ordinal` + 批内偏移」分配，读取一律按 `(created_at, ordinal)` 排序。
+跨进程并发写同一会话时，`ordinal` 分配需由上层会话锁串行化（与 ES 归档侧同一约定）。
 
 会话表索引：`(tenant_id, dept_id, status)`（租户科室维度列表）与 `(updated_at)`（TTL 扫描）。
 
@@ -323,7 +329,8 @@ payload_len(4B, LE) | payload(protobuf SessionSnapshot) | sha256(32B)
 - [ ] 业务 ID 满足 `^[A-Za-z0-9_.-]+$` 且不含 `:` / `{}`
 - [ ] `message_id` 为合法 UUID（推荐 UUIDv7）
 - [ ] Redis 客户端未开启 `decode_responses`；集群模式使用 `{session_id}` hash tag
-- [ ] MySQL 写入按 `crc32(session_id) % 16` 路由到正确分表
+- [ ] MySQL 写入按 `crc32(session_id) % 16` 路由到正确分表，并写入会话内单调递增的 `ordinal`
+- [ ] MySQL / ES 读取按 `(created_at, ordinal)` 排序，未使用同毫秒内随机的 `message_id` 做 tiebreaker
 - [ ] ES 归档按 UTC 月份滚动写入 `med-chat-archive-{yyyy.MM}`，排序键含 `ordinal`
 - [ ] 会话状态流转符合 4.1 状态机，非法流转被拒绝
 - [ ] 快照导入前校验 SHA-256 与命名空间一致性

@@ -1,8 +1,9 @@
 """存储适配层：统一的医疗会话历史抽象、工厂注册器、历史解析器与各存储引擎实现。
 
 导入本包即完成内置存储适配器的注册：``memory`` 与 ``file`` 始终可用；
-``redis`` 依赖可选包 ``redis``、MySQL 分表路由依赖可选包 ``SQLAlchemy``、
-``elasticsearch`` 归档依赖可选包 ``elasticsearch``，缺失时静默跳过，其余后端不受影响。
+``redis`` / ``redis-cluster`` 依赖可选包 ``redis``、``mysql`` 分表后端依赖可选包
+``SQLAlchemy``、``elasticsearch`` 归档依赖可选包 ``elasticsearch``，
+缺失时静默跳过，其余后端不受影响。
 上层可直接通过 ``StoreFactory.create("memory", ...)`` 取用。
 """
 
@@ -35,8 +36,9 @@ with contextlib.suppress(ImportError):  # redis 为可选依赖，缺失时不�
     from .redis_cluster_store import RedisClusterMedHistory, build_cluster_client
     from .redis_store import ExpiryCallback, RedisMedHistory
 
-with contextlib.suppress(ImportError):  # SQLAlchemy 为可选依赖，缺失时不导出分表路由
+with contextlib.suppress(ImportError):  # SQLAlchemy 为可选依赖，缺失时不注册 mysql 后端
     from .mysql_shard_router import DEFAULT_ROUTER, ShardRouter
+    from .mysql_store import DEFAULT_MYSQL_URL, MySQLMedHistory
 
 with contextlib.suppress(ImportError):  # elasticsearch 为可选依赖，缺失时不注册归档后端
     from .es_store import (
@@ -51,6 +53,7 @@ with contextlib.suppress(ImportError):  # elasticsearch 为可选依赖，缺失
 __all__ = [
     "ARCHIVE_INDEX_PREFIX",
     "ARCHIVE_TEMPLATE_NAME",
+    "DEFAULT_MYSQL_URL",
     "DEFAULT_PAGE_SIZE",
     "DEFAULT_ROUTER",
     "MAX_PAGE_SIZE",
@@ -66,6 +69,7 @@ __all__ = [
     "InMemorySessionRepository",
     "MedChatMessageHistory",
     "MessageRepository",
+    "MySQLMedHistory",
     "RedisClusterMedHistory",
     "RedisMedHistory",
     "SessionRepository",

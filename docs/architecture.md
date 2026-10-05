@@ -62,7 +62,8 @@ LLM 本身无状态，对话的「记忆」必须由外部存储承担。本库�
 │  ├─ factory.py   StoreFactory.register("redis") 装饰器注册             │
 │  ├─ history_resolver.py  会话 → 历史实例解析（主/备存储）                │
 │  ├─ memory_store.py / file_store.py / redis_store.py                  │
-│  ├─ redis_cluster_store.py / mysql_schema.py / mysql_shard_router.py  │
+│  ├─ redis_cluster_store.py / mysql_store.py                           │
+│  ├─ mysql_schema.py / mysql_shard_router.py   分表结构 + hash 路由     │
 │  ├─ es_store.py      冷归档（按月滚动索引 + bulk）                      │
 │  └─ *_repository.py  会话索引 / 消息仓储（补 history 回答不了的列表查询）  │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -174,6 +175,20 @@ HTTP POST /sessions/{id}/messages
 
 **理由**：统一的 TTL 语义（`set_ttl` / `refresh_ttl` / `is_expired`）跨后端一致，
 上层无需感知底层差异；不支持的组合在设置时即抛 `StorageError`，而非静默失效。
+
+### ADR-8 · 关系型分表用存储层 `ordinal` 保序
+
+**决策**：消息分表额外带一列存储层自增序号 `ordinal`（不属于 `MedMessage` 字段集），
+由 `MySQLMedHistory` 在写入时按「会话内最大序号 + 批内偏移」分配；读取按
+`(created_at, ordinal)` 排序。ES 归档侧同样写入 `ordinal`，语义对齐。
+
+**理由**：`message_id` 是 UUIDv7，**同毫秒内随机**，仅按 `created_at` 排序无法还原写入顺序
+（关系型表也不保证同值行的返回顺序）；而内存 / 文件 / Redis 后端靠「稳定排序 + 追加序」
+天然保序，若 MySQL 不显式保序就会出现跨后端语义漂移。归档层同理，
+排序键必须含 `ordinal`。
+
+**代价**：`ordinal` 的「读最大值 + 批量插入」不是原子操作，跨进程并发写同一会话
+需由上层会话锁（`runnable/lock.py`）串行化；`med_session` 行的 upsert 同理。
 
 ---
 

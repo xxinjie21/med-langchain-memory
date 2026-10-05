@@ -10,7 +10,7 @@
 **定位**：基于 LangChain `BaseChatMessageHistory` 抽象的医疗专属分布式会话存储中间件，面向医院医患问诊会话的持久化、多存储适配、医疗合规与上下文优化。
 
 **核心能力**：
-- 医患对话消息持久化：内存 / 本地文件 / Redis 集群 / MySQL 分表 / Elasticsearch 归档，五种存储适配器 + 工厂注册
+- 医患对话消息持久化：内存 / 本地文件 / Redis 单机 / Redis 集群 / MySQL 分表 / Elasticsearch 归档，六种存储适配器 + 工厂注册
 - 统一 Protobuf 序列化协议，支持会话 TTL 自动归档、快照备份、跨存储迁移
 - 医疗增强版 `RunnableWithMessageHistory`：多租户科室权限隔离、时序上下文裁剪、Token 预算控制、长会话 LLM 摘要压缩、并发会话锁、读写降级兜底
 - 医疗隐私字段级规则脱敏（手机号/身份证/病历号等结构化字段，纯正则规则策略，**不含任何文本解析预处理逻辑**）
@@ -152,6 +152,15 @@ med-langchain-memory/
 | D34 | API 鉴权 | API Key + 科室 scope 校验依赖、401/403 单测 | `feat(api): add api-key auth with department scope enforcement` |
 | D35 | 文档收尾 | README 完善（徽章/快速开始/架构图）、docs/storage-spec.md 发布 | `docs: complete readme, architecture and storage spec` |
 
+### 阶段 5：存储补齐（D36–）
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D36 | MySQL 适配器 | `MySQLMedHistory` 注册 `mysql` 后端：`crc32(session_id) % 16` 分表写入 + `med_session` 会话行 upsert + `ordinal` 会话内保序 | `feat(stores): implement mysql sharded store with ordered writes` |
+
+> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① MySQL 真机集成测试（docker-compose）；
+> ② Redis/ES 真机端到端用例（标记 `integration`，CI 可选）；③ 发布 `0.1.0` tag + `release.yml`。
+
 ---
 
 ## 四、对外存储规范（本库为规范定义方）
@@ -216,7 +225,7 @@ git push origin main
 
 ## 六、简历技术亮点（本项目）
 
-1. 设计并开源基于 LangChain `BaseChatMessageHistory` 的医疗会话存储中间件，通过适配器+工厂+注册器模式支持内存/文件/Redis 集群/MySQL 分表/ES 五种存储引擎热插拔
+1. 设计并开源基于 LangChain `BaseChatMessageHistory` 的医疗会话存储中间件，通过适配器+工厂+注册器模式支持内存/文件/Redis 单机/Redis 集群/MySQL 分表/ES 归档六种存储引擎热插拔
 2. 制定跨语言 Protobuf 会话序列化规范，实现会话 TTL 自动归档、快照备份、断点续传式跨存储迁移
 3. 自研医疗增强版 `RunnableWithMessageHistory`：多租户科室命名空间隔离、时序窗口+Token 预算双层上下文裁剪、长会话 LLM 摘要压缩，长会话场景下上下文 Token 成本显著降低
 4. 实现 Redis 分布式会话锁（看门狗续期+本地锁降级）与主备存储熔断兜底，保障并发问诊场景数据一致性与可用性

@@ -115,11 +115,21 @@ class TestTableDefinitions:
             "token_count",
             "masked",
             "created_at",
+            "ordinal",
             "metadata",
         }
         for table in MESSAGE_TABLES.values():
             assert {c.name for c in table.columns} == expected
             assert [c.name for c in table.primary_key] == ["message_id"]
+
+    def test_ordinal_column_is_not_nullable_and_defaults_to_zero(self) -> None:
+        column = message_table(0).c.ordinal
+        assert column.nullable is False
+        assert column.server_default is not None
+
+    def test_session_time_index_includes_ordinal(self) -> None:
+        index = next(idx for idx in message_table(0).indexes if "created_at" in idx.name)
+        assert [column.name for column in index.columns] == ["session_id", "created_at", "ordinal"]
 
     def test_session_table_columns(self) -> None:
         assert {c.name for c in SESSION_TABLE.columns} == {
@@ -194,6 +204,27 @@ class TestMessageRowMapping:
         assert row["role"] == "patient"
         assert row["masked"] is True
         assert row["metadata"] == {"channel": "app"}
+
+    def test_message_to_row_defaults_ordinal_to_zero(self) -> None:
+        assert message_to_row(_make_message())["ordinal"] == 0
+
+    def test_message_to_row_accepts_explicit_ordinal(self) -> None:
+        assert message_to_row(_make_message(), ordinal=7)["ordinal"] == 7
+
+    @pytest.mark.parametrize("ordinal", [-1, -100])
+    def test_message_to_row_rejects_negative_ordinal(self, ordinal: int) -> None:
+        with pytest.raises(ValidationError, match="ordinal must be"):
+            message_to_row(_make_message(), ordinal=ordinal)
+
+    def test_ordinal_roundtrip_through_sqlite(self, engine: Engine) -> None:
+        message = _make_message()
+        table = message_table(2)
+        with engine.begin() as conn:
+            conn.execute(insert(table).values(message_to_row(message, ordinal=9)))
+        with engine.connect() as conn:
+            row = conn.execute(select(table)).mappings().one()
+        assert row["ordinal"] == 9
+        assert message_from_row(row) == message
 
     def test_message_roundtrip_through_sqlite(self, engine: Engine) -> None:
         message = _make_message()
