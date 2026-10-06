@@ -115,6 +115,7 @@ src/med_langchain_memory/
 ├── privacy/       # 字段级正则脱敏（手机号 / 身份证 / 病历号 / 床号）
 ├── runnable/      # 医疗增强 Runnable：租户隔离、Token 裁剪、LLM 摘要、并发锁、降级熔断
 ├── api/           # FastAPI 会话管理接口
+├── testing/       # 集成测试支撑：真实中间件探针与开关（纯标准库，不参与生产链路）
 ├── config.py      # 全局配置（pydantic-settings）
 └── exceptions.py  # 统一异常体系
 ```
@@ -237,9 +238,39 @@ mypy
 
 ---
 
+## 集成测试（真实中间件，可选）
+
+默认 `pytest` **不需要任何真实中间件**。真实后端用例单独放在 `tests/test_integration/`，
+统一打 `integration` 标记，并且需要同时满足两个条件才会真正执行：
+
+1. 环境变量 `MED_MEMORY_IT=1`（显式开关）；
+2. 目标服务端口可连。
+
+任一条件不满足时用例自动 `skip`，跳过原因里带可复制的启动命令。
+
+```bash
+docker compose -f docker-compose.integration.yml up -d      # Redis + MySQL + Elasticsearch
+MED_MEMORY_IT=1 pytest -m integration                       # 只跑真实后端用例
+docker compose -f docker-compose.integration.yml down -v
+```
+
+| 项 | 说明 |
+|---|---|
+| 服务地址 | 默认 `redis://localhost:16379/15` · `mysql+pymysql://root:med@localhost:13306/med_memory` · `http://localhost:19200` |
+| 端口约定 | 宿主端口刻意避开标准端口（6379 / 3306 / 9200），避免与本机既有中间件抢占 |
+| 地址覆盖 | `MED_MEMORY_IT_REDIS_URL` / `MED_MEMORY_IT_MYSQL_URL` / `MED_MEMORY_IT_ELASTICSEARCH_URL` |
+| 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引） |
+| MySQL 前置 | 需宿主侧自备 DBAPI 驱动（如 `pip install pymysql`），缺失时 MySQL 用例跳过 |
+| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + 每周定时），不阻塞 `ci.yml` 必过门禁 |
+
+探针与开关逻辑在 `med_langchain_memory/testing/services.py`，只用标准库，
+因此「能不能跑」的判断本身不依赖任何中间件客户端。
+
+---
+
 ## 每日迭代节奏
 
-项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4 全部迭代（D1–D35）。
+项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35）与阶段 5 存储补齐（D36–D37）。
 
 ---
 

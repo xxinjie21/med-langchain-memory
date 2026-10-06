@@ -67,6 +67,9 @@ LLM 本身无状态，对话的「记忆」必须由外部存储承担。本库�
 │  ├─ es_store.py      冷归档（按月滚动索引 + bulk）                      │
 │  └─ *_repository.py  会话索引 / 消息仓储（补 history 回答不了的列表查询）  │
 ├──────────────────────────────────────────────────────────────────────┤
+│  testing/        测试支撑层（纯标准库，不参与生产链路）                 │
+│  └─ services.py  集成测试服务探针 + 显式开关（TCP 可达性判定）           │
+├──────────────────────────────────────────────────────────────────────┤
 │  serde/          序列化层：Serializer 抽象 + ProtobufSerializer          │
 ├──────────────────────────────────────────────────────────────────────┤
 │  domain/         领域模型：MedMessage · SessionMeta · AuditEvent         │
@@ -81,7 +84,9 @@ LLM 本身无状态，对话的「记忆」必须由外部存储承担。本库�
 * `domain` / `serde` 为叶子层，无内部依赖；
 * 下层不得反向 import 上层（如 `stores` 不得引用 `api`）；
 * `api` 是**可选依赖层**：未安装 FastAPI 时整包仍可正常使用，因此
-  `med_langchain_memory/__init__.py` 不导入 `api`。
+  `med_langchain_memory/__init__.py` 不导入 `api`；
+* `testing` 是**旁路层**：只依赖 `exceptions`，不依赖任何中间件客户端，
+  也不被其它层引用（仅 `tests/` 使用）。
 
 ---
 
@@ -190,6 +195,27 @@ HTTP POST /sessions/{id}/messages
 **代价**：`ordinal` 的「读最大值 + 批量插入」不是原子操作，跨进程并发写同一会话
 需由上层会话锁（`runnable/lock.py`）串行化；`med_session` 行的 upsert 同理。
 
+### ADR-9 · 真实中间件集成测试用「显式开关 + TCP 探针」，默认离线全绿
+
+**决策**：真实后端用例集中在 `tests/test_integration/` 并统一打 `integration` 标记，
+执行前须同时满足「环境变量 `MED_MEMORY_IT=1`」与「目标服务端口可连」；
+不满足时用例 `skip` 并把可复制的 `docker compose` 启动命令写进跳过原因。
+探针与开关放在 `testing/services.py`，**只依赖标准库**（`socket` / `urllib.parse`），
+不导入任何中间件客户端。
+
+**理由**：
+
+* 日常 `pytest` 与必过 CI（`ci.yml`）不能被容器依赖拖慢或拖红——集成测试放在
+  可选工作流 `integration.yml`（手动触发 + 每周定时）里；
+* 若探针模块自己 import `redis` / `elasticsearch`，缺包时连「跳过」都做不到，
+  测试支撑模块会反向依赖可选后端；纯标准库的 TCP 探针没有这个约束；
+* 断言复用 `tests/test_stores/behavior.py` 的跨后端行为基准套件，
+  替身单测与真实后端走**同一份语义契约**，避免两套断言各自漂移。
+
+**代价**：TCP 可连不等于协议就绪（MySQL 冷启动、ES 集群初始化），
+因此夹具在探针之后还要做一次客户端级握手重试，就绪判定比纯端口探测更慢；
+这也是默认 `WAIT_SECONDS=120` 的来源。
+
 ---
 
 ## 5. 并发与可用性
@@ -240,6 +266,8 @@ HTTP POST /sessions/{id}/messages
 | 替身中间件 | `fakeredis`（无 Lua，用 `WATCH`/`MULTI`/`EXEC` 事务实现锁）、SQLite 内存库、自写 fake ES |
 | 无真实依赖 | 全量单测不需要真实 Redis / MySQL / ES，CI 无需起容器 |
 | 行为基准套件 | `tests/test_stores/behavior.py` 供各后端复用，保证语义一致 |
+| 真实后端集成 | `tests/test_integration/` + `integration` 标记：`MED_MEMORY_IT=1` 且服务可达才执行，否则跳过；同一份行为基准套件在真机上再跑一遍 |
+| 集成环境编排 | `docker-compose.integration.yml`（Redis / MySQL / ES 三服务带健康检查）；可选工作流 `.github/workflows/integration.yml` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |
 

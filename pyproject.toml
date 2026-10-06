@@ -82,6 +82,9 @@ ignore_errors = true
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
 pythonpath = ["src"]
+markers = [
+    "integration: 需要真实中间件（Redis / MySQL / Elasticsearch）的集成用例；需 MED_MEMORY_IT=1 且服务可达，否则自动跳过",
+]
 
 [tool.coverage.run]
 source = ["med_langchain_memory"]

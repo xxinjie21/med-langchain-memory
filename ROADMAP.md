@@ -36,6 +36,7 @@ med-langchain-memory/
 │       └── release.yml             # tag 发布（后期）
 ├── protos/
 │   └── med_session.proto           # 统一序列化协议（跨语言规范源）
+├── docker-compose.integration.yml  # 集成测试用 Redis/MySQL/ES 本地编排
 ├── src/med_langchain_memory/
 │   ├── __init__.py
 │   ├── config.py                   # 全局配置（pydantic-settings）
@@ -78,11 +79,13 @@ med-langchain-memory/
 │       │   ├── messages.py
 │       │   └── admin.py            # 归档/迁移管理
 │       └── schemas.py              # 请求/响应 DTO
+│   └── testing/                    # 集成测试支撑（纯标准库探针与开关）
 ├── tests/                          # 与 src 镜像的全量单测
 │   ├── conftest.py
 │   ├── test_domain/ test_serde/ test_stores/
 │   ├── test_lifecycle/ test_privacy/ test_runnable/
-│   └── test_api/
+│   ├── test_api/ test_ci/ test_docs/
+│   └── test_integration/           # 真实中间件用例（integration 标记，默认跳过）
 └── docs/
     ├── architecture.md             # 架构图与设计决策
     └── storage-spec.md             # 存储字段/序列化跨语言规范（对外发布）
@@ -157,9 +160,10 @@ med-langchain-memory/
 | Day | 任务 | 实现要点 | Commit 信息 |
 |---|---|---|---|
 | D36 | MySQL 适配器 | `MySQLMedHistory` 注册 `mysql` 后端：`crc32(session_id) % 16` 分表写入 + `med_session` 会话行 upsert + `ordinal` 会话内保序 | `feat(stores): implement mysql sharded store with ordered writes` |
+| D37 | 真实中间件集成测试 | `docker-compose.integration.yml` 三服务编排 + `testing/services.py`（纯标准库 TCP 探针 + `MED_MEMORY_IT` 显式开关）+ `tests/test_integration/`（复用行为基准套件，打 `integration` 标记，默认跳过）+ 可选工作流 `integration.yml` | `feat(stores): add opt-in real middleware integration test harness` |
 
-> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① MySQL 真机集成测试（docker-compose）；
-> ② Redis/ES 真机端到端用例（标记 `integration`，CI 可选）；③ 发布 `0.1.0` tag + `release.yml`。
+> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 发布 `0.1.0` tag + `release.yml`；
+> ② Redis Cluster 真机用例（需三主三从编排）；③ 集成测试纳入夜间 CI 并上报趋势。
 
 ---
 
@@ -220,6 +224,10 @@ git push origin main
 ```
 
 分批顺序约定：`domain → serde → stores → lifecycle → privacy → runnable → api → tests → ci/配置`。单测可随功能模块同 commit，也可独立 `test(scope)` commit；禁止一天所有变更混在一个大 commit 里推送。
+
+> **自动化每日迭代的例外**：由无人值守任务执行的每日迭代（D1 起）采用
+> **单次 `git add -A` + 单个 commit + 单次 push** 的收敛式提交，
+> 便于逐迭代回溯与失败重放；人工迭代仍按上述分批约定执行。
 
 ---
 

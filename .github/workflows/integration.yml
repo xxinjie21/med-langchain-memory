@@ -1,0 +1,62 @@
+name: Integration
+
+# 真实中间件集成测试：**可选**，不阻塞日常 CI（ci.yml 仍为唯一必过门禁）。
+# 触发方式：手动 workflow_dispatch，或每周日 18:00 UTC 定时跑一次。
+#
+# 覆盖范围：Redis 与 Elasticsearch 两个服务（两者的客户端都在 dev extra 里）。
+# MySQL 未纳入本 workflow——连接真实 MySQL 需要额外 DBAPI 驱动（如 pymysql），
+# 不属于项目声明的依赖集；需要时请在本地用 docker-compose.integration.yml 起库并安装驱动。
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 18 * * 0"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Integration (real middleware)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 16379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        ports:
+          - 19200:9200
+        options: >-
+          --health-cmd "curl -fs http://localhost:9200/_cluster/health"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 24
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run integration tests
+        env:
+          MED_MEMORY_IT: "1"
+          MED_MEMORY_IT_REDIS_URL: redis://localhost:16379/15
+          MED_MEMORY_IT_ELASTICSEARCH_URL: http://localhost:19200
+        run: pytest -m integration

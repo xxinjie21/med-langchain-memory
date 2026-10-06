@@ -1,0 +1,61 @@
+# 真实中间件集成测试的本地服务编排（**不参与生产部署**）。
+#
+# 用法：
+#   docker compose -f docker-compose.integration.yml up -d
+#   MED_MEMORY_IT=1 pytest -m integration
+#   docker compose -f docker-compose.integration.yml down -v
+#
+# 三个服务的地址与 src/med_langchain_memory/testing/services.py 的内置默认值一一对应：
+#   redis://localhost:16379/15
+#   mysql+pymysql://root:med@localhost:13306/med_memory
+#   http://localhost:19200
+#
+# 刻意使用**非默认宿主端口**（16379 / 13306 / 19200）：开发机上常常已经跑着
+# 标准端口（6379 / 3306 / 9200）的中间件，占用会直接导致 `up` 失败。
+# 用独立端口号隔离，集成栈与本机既有服务互不干扰。
+#
+# CI 侧的可选自动化见 .github/workflows/integration.yml（以服务容器起 Redis 与 Elasticsearch）。
+# Redis 单独使用 DB 15，避免与开发者本机其它数据混用。
+# MySQL 需要宿主侧自备 DBAPI 驱动（如 `pip install pymysql`），
+# 否则 MySQL 集成用例会以「驱动缺失」跳过——本编排文件本身不受影响。
+name: med-memory-integration
+
+services:
+  redis:
+    image: redis:7-alpine
+    # 集成测试只验证读写语义，不需要落盘。
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: med
+      MYSQL_DATABASE: med_memory
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pmed"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "19200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
