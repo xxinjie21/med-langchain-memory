@@ -51,7 +51,7 @@
 | Token 计算 | tiktoken | 上下文按 Token 预算裁剪 |
 | API 层 | FastAPI | 轻量会话管理接口（增删查、迁移、归档触发） |
 | 测试 | pytest + fakeredis + sqlite 内存库 | 全量单测，不依赖真实中间件 |
-| CI | GitHub Actions | 多版本矩阵测试 + 覆盖率门禁 + lint/type-check |
+| CI | GitHub Actions | 多版本矩阵测试 + 覆盖率门禁 + lint/type-check + tag 发布流水线（版本守卫 + 构建 + Release） |
 
 ---
 
@@ -268,9 +268,45 @@ docker compose -f docker-compose.integration.yml down -v
 
 ---
 
+## 发布与版本
+
+**版本单一事实源**：`pyproject.toml` 的 `[project].version` 与包内
+`med_langchain_memory.__version__` 必须逐字一致（由 `tests/test_package.py` 守住），
+发布 tag 也必须与之逐字一致。
+
+发布流程由 `.github/workflows/release.yml` 承载，只由 `v*` 形态的 tag 触发
+（如 `v0.1.0`），分支推送与 PR **不会**触发发布：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0        # 触发 release.yml
+```
+
+工作流分三个作业，逐级卡关：
+
+| 作业 | 动作 |
+|---|---|
+| `verify` | ① 版本守卫：tag ↔ pyproject ↔ `__version__` 三方比对；② 全量 `pytest`；③ `python -m build` 产出 sdist + wheel；④ 产物校验：sdist/wheel 齐全、wheel 内必需成员与元数据版本正确；⑤ 上传 `distributions` artifact |
+| `github-release` | 用官方 `gh release create` 建 Release，附上 sdist/wheel 并自动生成说明（`--verify-tag` 保证 tag 真实存在） |
+| `publish-pypi` | **默认关闭**；仅当仓库变量 `PUBLISH_TO_PYPI` 设为 `true` 时执行，走 PyPI Trusted Publishing（OIDC），不需要任何 token secret |
+
+权限按最小化授予：顶层 `contents: read`，只有建 Release 的作业提升为
+`contents: write`，只有 PyPI 作业持有 `id-token: write`。
+
+守卫本身是一个纯标准库模块，可在本地预演同样的检查：
+
+```bash
+python -m med_langchain_memory.release --tag v0.1.0                     # 版本一致性
+python -m med_langchain_memory.release --dist dist --expected-version v0.1.0   # 产物完整性
+```
+
+两条命令通过返回 `0`，失败返回 `1` 并逐条打印差异（CI 日志里可直接定位）。
+
+---
+
 ## 每日迭代节奏
 
-项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35）与阶段 5 存储补齐（D36–D37）。
+项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线）。
 
 ---
 

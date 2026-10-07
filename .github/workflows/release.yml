@@ -1,0 +1,92 @@
+name: Release
+
+# 发布流水线：只有推送形如 `v0.1.0` 的 tag 才会触发。
+# 版本单一事实源是 pyproject.toml 的 [project].version，tag 必须与之逐字一致，
+# 否则 `verify` 作业在构建前就直接失败（不会产出半成品 Release）。
+on:
+  push:
+    tags: ["v*"]
+
+# 默认最小权限；只有创建 Release 的作业才把 contents 提升为可写。
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify & Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Check tag against package version
+        run: python -m med_langchain_memory.release --tag "${{ github.ref_name }}"
+
+      - name: Run test suite
+        run: pytest
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Verify distribution artifacts
+        run: >-
+          python -m med_langchain_memory.release
+          --dist dist
+          --expected-version "${{ github.ref_name }}"
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+          retention-days: 7
+
+  github-release:
+    name: Publish GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist
+
+      - name: Create release with artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes
+
+  publish-pypi:
+    name: Publish to PyPI
+    # 默认关闭：仅当仓库变量 PUBLISH_TO_PYPI 显式设为 true 时才执行。
+    # 走 PyPI Trusted Publishing（OIDC），因此不需要任何 token secret。
+    if: vars.PUBLISH_TO_PYPI == 'true'
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

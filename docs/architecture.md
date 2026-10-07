@@ -216,6 +216,31 @@ HTTP POST /sessions/{id}/messages
 因此夹具在探针之后还要做一次客户端级握手重试，就绪判定比纯端口探测更慢；
 这也是默认 `WAIT_SECONDS=120` 的来源。
 
+### ADR-10 · 发布门禁用「可执行模块」而非 YAML 里的内联脚本
+
+**决策**：tag 发布（`.github/workflows/release.yml`）把版本一致性与产物完整性
+两件事都收敛到 `med_langchain_memory/release.py` 一个纯标准库模块里，
+工作流只负责按顺序调用：
+
+```
+release.py --tag "${{ github.ref_name }}"        # 构建前：tag ↔ pyproject ↔ __version__
+python -m build
+release.py --dist dist --expected-version "${{ github.ref_name }}"   # 构建后：sdist/wheel 完整性
+```
+
+**理由**：
+
+* 内联 shell / python 片段无法被 `pytest` 覆盖，也容易在 YAML 缩进里悄悄写错；
+  抽成模块后，两条门禁各有正向与边界用例（合成 wheel/sdist 即可全量验证，无需真实构建）；
+* 版本漂移（改了代码忘了改版本、tag 打错、dist 里躺着上一次构建的旧 wheel）是
+  发布事故最常见来源，必须在**构建前**和**发布前**各卡一道；
+* 只有 `contents: read` 的顶层权限 + 写权限下放到单个作业，配合
+  「PyPI 发布默认关闭（仓库变量开关）+ OIDC 可信发布」把误发布面降到最小。
+
+**代价**：守卫随包一起发布（多一个几十行的小模块）；工作流里的 CLI 选项需要
+与模块保持同步——为此 `tests/test_ci/test_release_workflow.py` 直接调用
+`build_parser()` 断言「工作流用到的选项真实存在」。
+
 ---
 
 ## 5. 并发与可用性
@@ -269,6 +294,7 @@ HTTP POST /sessions/{id}/messages
 | 真实后端集成 | `tests/test_integration/` + `integration` 标记：`MED_MEMORY_IT=1` 且服务可达才执行，否则跳过；同一份行为基准套件在真机上再跑一遍 |
 | 集成环境编排 | `docker-compose.integration.yml`（Redis / MySQL / ES 三服务带健康检查）；可选工作流 `.github/workflows/integration.yml` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
+| 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |
 
 ---

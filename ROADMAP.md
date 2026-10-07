@@ -32,8 +32,9 @@ med-langchain-memory/
 ├── .pre-commit-config.yaml         # ruff + mypy 钩子
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml                  # pytest + coverage + lint
-│       └── release.yml             # tag 发布（后期）
+│       ├── ci.yml                  # pytest + coverage + lint（必过门禁）
+│       ├── integration.yml         # 真实中间件集成用例（手动 + 每周定时，可选）
+│       └── release.yml             # tag 发布：版本守卫 + 构建 + 产物校验 + GitHub Release
 ├── protos/
 │   └── med_session.proto           # 统一序列化协议（跨语言规范源）
 ├── docker-compose.integration.yml  # 集成测试用 Redis/MySQL/ES 本地编排
@@ -71,15 +72,16 @@ med-langchain-memory/
 │   │   ├── summarizer.py           # 长会话 LLM 摘要压缩
 │   │   ├── lock.py                 # 并发会话锁（Redis 分布式锁+本地降级）
 │   │   └── fallback.py             # 读写降级兜底（熔断器）
-│   └── api/                        # FastAPI 接口层
-│       ├── app.py
-│       ├── deps.py                 # 鉴权/依赖注入
-│       ├── routers/
-│       │   ├── sessions.py
-│       │   ├── messages.py
-│       │   └── admin.py            # 归档/迁移管理
-│       └── schemas.py              # 请求/响应 DTO
-│   └── testing/                    # 集成测试支撑（纯标准库探针与开关）
+│   ├── api/                        # FastAPI 接口层
+│   │   ├── app.py
+│   │   ├── deps.py                 # 鉴权/依赖注入
+│   │   ├── routers/
+│   │   │   ├── sessions.py
+│   │   │   ├── messages.py
+│   │   │   └── admin.py            # 归档/迁移管理
+│   │   └── schemas.py              # 请求/响应 DTO
+│   ├── testing/                    # 集成测试支撑（纯标准库探针与开关）
+│   └── release.py                  # 发布守卫（tag/版本一致性 + 产物校验，纯标准库）
 ├── tests/                          # 与 src 镜像的全量单测
 │   ├── conftest.py
 │   ├── test_domain/ test_serde/ test_stores/
@@ -155,15 +157,16 @@ med-langchain-memory/
 | D34 | API 鉴权 | API Key + 科室 scope 校验依赖、401/403 单测 | `feat(api): add api-key auth with department scope enforcement` |
 | D35 | 文档收尾 | README 完善（徽章/快速开始/架构图）、docs/storage-spec.md 发布 | `docs: complete readme, architecture and storage spec` |
 
-### 阶段 5：存储补齐（D36–）
+### 阶段 5：存储补齐与发布工程（D36–）
 
 | Day | 任务 | 实现要点 | Commit 信息 |
 |---|---|---|---|
 | D36 | MySQL 适配器 | `MySQLMedHistory` 注册 `mysql` 后端：`crc32(session_id) % 16` 分表写入 + `med_session` 会话行 upsert + `ordinal` 会话内保序 | `feat(stores): implement mysql sharded store with ordered writes` |
 | D37 | 真实中间件集成测试 | `docker-compose.integration.yml` 三服务编排 + `testing/services.py`（纯标准库 TCP 探针 + `MED_MEMORY_IT` 显式开关）+ `tests/test_integration/`（复用行为基准套件，打 `integration` 标记，默认跳过）+ 可选工作流 `integration.yml` | `feat(stores): add opt-in real middleware integration test harness` |
+| D38 | 发布流水线 | `release.py`（纯标准库发布守卫：tag ↔ pyproject ↔ `__version__` 三方比对 + sdist/wheel 完整性与元数据版本校验 + CLI）+ `release.yml`（`v*` tag 触发：守卫 → 全量测试 → 构建 → 产物校验 → GitHub Release，PyPI 走 OIDC 可信发布且默认关闭）+ `tests/test_release.py`、`tests/test_ci/test_release_workflow.py` | `feat: daily iteration D38 - tag-driven release pipeline with version guard` |
 
-> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 发布 `0.1.0` tag + `release.yml`；
-> ② Redis Cluster 真机用例（需三主三从编排）；③ 集成测试纳入夜间 CI 并上报趋势。
+> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① Redis Cluster 真机用例（需三主三从编排）；
+> ② 集成测试纳入夜间 CI 并上报趋势；③ 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`）。
 
 ---
 
