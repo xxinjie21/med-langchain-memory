@@ -7,6 +7,9 @@ These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
   and must never be merged into the mandatory ``ci.yml`` gate;
 * it must select the integration suite explicitly (``-m integration``) and
   switch the harness on via ``MED_MEMORY_IT=1``;
+* the Redis Cluster must be started through ``docker-compose.integration.yml``
+  (GitHub Actions ``services:`` cannot express a 6-node cluster), with the
+  announce IP pinned to the compose subnet gateway and a teardown step;
 * the ``integration`` marker must be registered in ``pyproject.toml``
   (``--strict-markers`` is enabled, so an unregistered marker fails the run);
 * every ``uses:`` reference must stay pinned to a major version tag.
@@ -19,6 +22,8 @@ import tomllib
 from pathlib import Path
 
 import pytest
+
+from med_langchain_memory.testing import DEFAULT_SERVICES
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "integration.yml"
@@ -96,6 +101,40 @@ class TestJob:
         assert 'pip install -e ".[dev]"' in read_workflow()
 
 
+class TestRedisClusterJob:
+    """Redis Cluster 必须由 compose 拉起（``services:`` 只支持单容器）。"""
+
+    def test_starts_all_six_cluster_nodes_via_compose(self) -> None:
+        """正向：6 个集群节点全部通过编排文件启动。"""
+        text = read_workflow()
+        assert COMPOSE_PATH.name in text
+        for index in range(1, 7):
+            assert f"redis-cluster-{index}" in text, f"redis-cluster-{index} is not started"
+
+    def test_runs_the_one_shot_initializer(self) -> None:
+        """正向：初始化容器以 ``run --rm`` 方式执行（一次性组集群）。"""
+        text = read_workflow()
+        assert re.search(r"run --rm redis-cluster-init", text)
+
+    def test_sets_cluster_announce_ip_for_linux_runner(self) -> None:
+        """正向：显式声明广播地址（Linux runner 用固定子网网关）。"""
+        text = read_workflow()
+        assert "MED_MEMORY_IT_CLUSTER_IP" in text
+        assert "172.31.240.1" in text
+
+    def test_passes_cluster_url_to_tests(self) -> None:
+        """正向：用例侧拿到集群种子地址（与 ``DEFAULT_SERVICES`` 一致）。"""
+        text = read_workflow()
+        cluster = next(service for service in DEFAULT_SERVICES if service.name == "redis-cluster")
+        assert f"MED_MEMORY_IT_REDIS_CLUSTER_URL: {cluster.url}" in text
+
+    def test_tears_the_cluster_down_afterwards(self) -> None:
+        """边界：无论成败都要清理容器，避免 runner 上残留 6 个节点。"""
+        text = read_workflow()
+        assert "down -v" in text
+        assert re.search(r"if:\s*always\(\)", text)
+
+
 class TestActionPinning:
     def test_all_actions_pin_a_major_version(self) -> None:
         """边界：所有 ``uses:`` 引用都必须至少锁定大版本。"""
@@ -137,6 +176,12 @@ class TestDocumentation:
         assert COMPOSE_PATH.name in readme
         assert "MED_MEMORY_IT" in readme
         assert "-m integration" in readme
+
+    def test_readme_documents_cluster_announce_override(self) -> None:
+        """正向：README 必须说明 Docker Desktop 下要覆盖集群广播地址。"""
+        readme = README_PATH.read_text(encoding="utf-8")
+        assert "MED_MEMORY_IT_CLUSTER_IP" in readme
+        assert "redis-cluster" in readme
 
     @pytest.mark.parametrize("path", [WORKFLOW_PATH, COMPOSE_PATH])
     def test_deliverables_reference_each_other(self, path: Path) -> None:

@@ -20,7 +20,7 @@ from unittest.mock import patch
 import fakeredis
 import pytest
 from behavior import MedHistoryBehaviorSuite
-from redis.exceptions import RedisError
+from redis.exceptions import RedisClusterException, RedisError
 
 from med_langchain_memory.domain import MedMessage, MessageRole
 from med_langchain_memory.exceptions import StorageError
@@ -81,6 +81,38 @@ class _BoomClient:
 def broken_history() -> RedisClusterMedHistory:
     """注入了故障客户端的集群会话历史。"""
     return RedisClusterMedHistory(**NAMESPACE, client=_BoomClient())  # type: ignore[arg-type]
+
+
+class _ClusterStrictClient:
+    """模拟真实 ``redis.RedisCluster`` 的替身：拒绝 ``transaction=True`` 的 pipeline。
+
+    redis-py 集群客户端对事务 pipeline 的处理是**直接抛异常**：
+
+    ``RedisClusterException("transaction is deprecated in cluster mode")``
+
+    ``fakeredis.FakeRedis`` 不会暴露这一行为，故此处显式复现，
+    让「集群后端不得走事务 pipeline」这条约束可以在离线单测里被守护。
+    """
+
+    def __init__(self, inner: fakeredis.FakeRedis) -> None:
+        self._inner = inner
+
+    def pipeline(self, transaction: bool = True, *args: Any, **kwargs: Any) -> Any:
+        """仅接受非事务 pipeline，否则抛与真机一致的异常。"""
+        if transaction:
+            raise RedisClusterException("transaction is deprecated in cluster mode")
+        return self._inner.pipeline(transaction=False)
+
+    def __getattr__(self, name: str) -> Any:
+        """其余命令一律透传给内层替身。"""
+        return getattr(self._inner, name)
+
+
+@pytest.fixture
+def strict_cluster_history() -> RedisClusterMedHistory:
+    """注入「集群语义替身」的会话历史：任何事务 pipeline 都会当场失败。"""
+    client = _ClusterStrictClient(fakeredis.FakeRedis())
+    return RedisClusterMedHistory(**NAMESPACE, client=client)  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +199,67 @@ class TestClusterTtl:
 
         assert history.ttl_remaining() is None
         assert history.exists() is True
+
+
+# --------------------------------------------------------------------------- #
+# 集群 pipeline 语义（真机回归）
+# --------------------------------------------------------------------------- #
+class TestClusterPipelineSemantics:
+    """守护「集群后端不得使用事务 pipeline」这条真机约束。
+
+    真机 Redis Cluster 上 ``RedisCluster.pipeline(transaction=True)`` 会抛
+    ``RedisClusterException``，一旦回退成单机实现，``clear()`` / ``add_med_messages()``
+    等所有走 pipeline 的方法都会在集群上整体不可用。
+    """
+
+    def test_pipeline_is_not_transactional(
+        self, strict_cluster_history: RedisClusterMedHistory
+    ) -> None:
+        """正向：``_pipeline()`` 返回可用 pipeline，且未启用事务。"""
+        with strict_cluster_history._pipeline() as pipe:
+            assert pipe is not None
+
+    def test_append_and_clear_survive_cluster_semantics(
+        self, strict_cluster_history: RedisClusterMedHistory
+    ) -> None:
+        """正向：写入与清空在「拒绝事务」的客户端上依旧可用。"""
+        strict_cluster_history.add_med_messages([make_message("cluster write")])
+        assert [m.content for m in strict_cluster_history.get_med_messages()] == ["cluster write"]
+
+        strict_cluster_history.clear()
+
+        assert strict_cluster_history.get_med_messages() == []
+        assert strict_cluster_history.exists() is False
+
+    def test_ttl_commands_survive_cluster_semantics(
+        self, strict_cluster_history: RedisClusterMedHistory
+    ) -> None:
+        """正向：TTL 下发与取消（``PERSIST``）同样走非事务 pipeline。"""
+        strict_cluster_history.add_med_messages([make_message()])
+
+        strict_cluster_history.set_ttl(90)
+        assert strict_cluster_history.ttl_remaining() is not None
+
+        strict_cluster_history.set_ttl(None)
+        assert strict_cluster_history.ttl_remaining() is None
+
+    def test_constructor_ttl_survives_cluster_semantics(
+        self, strict_cluster_history: RedisClusterMedHistory
+    ) -> None:
+        """边界：构造期带 TTL 也不得触发事务 pipeline。"""
+        client = _ClusterStrictClient(fakeredis.FakeRedis())
+        history = RedisClusterMedHistory(**NAMESPACE, client=client, ttl_seconds=30)  # type: ignore[arg-type]
+
+        history.add_med_messages([make_message()])
+
+        assert history.ttl_remaining() is not None
+
+    def test_strict_stub_rejects_transactional_pipeline(self) -> None:
+        """边界：替身本身有效（正对照，防止约束形同虚设）。"""
+        client = _ClusterStrictClient(fakeredis.FakeRedis())
+
+        with pytest.raises(RedisClusterException, match="transaction is deprecated"):
+            client.pipeline(transaction=True)
 
 
 # --------------------------------------------------------------------------- #

@@ -187,8 +187,12 @@
 
 * **统一存储键**：`med:chat:{tenant_id}:{dept_id}:{session_id}`
 * **集群 hash tag**：以 `{session_id}` 作为 hash tag，保证同一会话的 `messages` / `meta`
-  两个键落在同一 slot（否则集群下无法用单次事务同时更新两者）
-* **批量写**：一次 `add_messages` 的全部命令打包进单个 pipeline 事务，仅一次网络往返
+  两个键落在同一 slot（否则集群下无法把两者的命令放进同一个 pipeline）。
+  租户 / 科室**不进** hash tag —— 否则整个租户会塌缩到单一 slot，丧失分片能力
+* **批量写**：一次 `add_messages` 的全部命令打包进单个 pipeline，仅一次网络往返。
+  单机用 `MULTI/EXEC` 事务 pipeline；**集群必须用非事务 pipeline** ——
+  redis-py 的集群客户端弃用了 `MULTI`（`pipeline(transaction=True)` 抛
+  `RedisClusterException`），集群侧由 hash tag 保证同 slot，放弃跨键原子性
 * **TTL**：会话级过期走 Redis 原生 `EXPIRE`；写入后滑动续期（可选读取也续期）；
   `set_ttl(None)` 下发 `PERSIST` 恢复永不过期
 * **⚠️ 客户端禁止开启 `decode_responses`**：消息体是 protobuf 二进制，解码会破坏数据
@@ -329,6 +333,7 @@ payload_len(4B, LE) | payload(protobuf SessionSnapshot) | sha256(32B)
 - [ ] 业务 ID 满足 `^[A-Za-z0-9_.-]+$` 且不含 `:` / `{}`
 - [ ] `message_id` 为合法 UUID（推荐 UUIDv7）
 - [ ] Redis 客户端未开启 `decode_responses`；集群模式使用 `{session_id}` hash tag
+- [ ] Redis 集群模式未使用事务 pipeline（`MULTI` 在集群下不可用），批量写走非事务 pipeline
 - [ ] MySQL 写入按 `crc32(session_id) % 16` 路由到正确分表，并写入会话内单调递增的 `ordinal`
 - [ ] MySQL / ES 读取按 `(created_at, ordinal)` 排序，未使用同毫秒内随机的 `message_id` 做 tiebreaker
 - [ ] ES 归档按 UTC 月份滚动写入 `med-chat-archive-{yyyy.MM}`，排序键含 `ordinal`

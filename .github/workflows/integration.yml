@@ -3,7 +3,8 @@ name: Integration
 # 真实中间件集成测试：**可选**，不阻塞日常 CI（ci.yml 仍为唯一必过门禁）。
 # 触发方式：手动 workflow_dispatch，或每周日 18:00 UTC 定时跑一次。
 #
-# 覆盖范围：Redis 与 Elasticsearch 两个服务（两者的客户端都在 dev extra 里）。
+# 覆盖范围：Redis / Elasticsearch 两个服务容器，以及用 docker compose 起的三主三从
+# Redis Cluster（GitHub Actions 的 `services:` 只支持单容器，6 节点集群只能走 compose）。
 # MySQL 未纳入本 workflow——连接真实 MySQL 需要额外 DBAPI 驱动（如 pymysql），
 # 不属于项目声明的依赖集；需要时请在本地用 docker-compose.integration.yml 起库并安装驱动。
 on:
@@ -54,9 +55,33 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
+      # 集群节点广播地址取编排固定子网的网关（172.31.240.1）：
+      # Linux runner 上容器与宿主机双向可达，因此无需像 Docker Desktop 那样覆盖。
+      - name: Start redis cluster
+        env:
+          MED_MEMORY_IT_CLUSTER_IP: 172.31.240.1
+        run: |
+          docker compose -f docker-compose.integration.yml up -d \
+            redis-cluster-1 redis-cluster-2 redis-cluster-3 \
+            redis-cluster-4 redis-cluster-5 redis-cluster-6
+          docker compose -f docker-compose.integration.yml run --rm redis-cluster-init
+
       - name: Run integration tests
         env:
           MED_MEMORY_IT: "1"
           MED_MEMORY_IT_REDIS_URL: redis://localhost:16379/15
+          MED_MEMORY_IT_REDIS_CLUSTER_URL: redis://localhost:17001/0
           MED_MEMORY_IT_ELASTICSEARCH_URL: http://localhost:19200
         run: pytest -m integration
+
+      - name: Dump redis cluster logs
+        if: failure()
+        env:
+          MED_MEMORY_IT_CLUSTER_IP: 172.31.240.1
+        run: docker compose -f docker-compose.integration.yml logs --tail 80
+
+      - name: Tear down redis cluster
+        if: always()
+        env:
+          MED_MEMORY_IT_CLUSTER_IP: 172.31.240.1
+        run: docker compose -f docker-compose.integration.yml down -v

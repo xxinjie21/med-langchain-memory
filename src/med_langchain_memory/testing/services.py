@@ -5,8 +5,8 @@
 
 * **要不要跑**——由环境变量 :data:`ENV_PREFIX`（``MED_MEMORY_IT``）显式开关决定；
   未开启时集成用例以 ``skip`` 收尾，普通 ``pytest`` 依旧只依赖替身中间件；
-* **能不能跑**——用 TCP 探针确认 Redis / MySQL / Elasticsearch 是否真的在监听，
-  不可达时给出「如何用 docker compose 起服务」的可执行提示，
+* **能不能跑**——用 TCP 探针确认 Redis / MySQL / Elasticsearch / Redis Cluster
+  是否真的在监听，不可达时给出「如何用 docker compose 起服务」的可执行提示，
   而不是让用例抛出一堆连接错误。
 
 设计取舍：
@@ -26,6 +26,7 @@ import socket
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit
 
 from med_langchain_memory.exceptions import ValidationError
@@ -50,6 +51,22 @@ _SCHEME_PORTS = {"redis": 6379, "mysql": 3306, "http": 9200, "https": 9200}
 
 #: 启动真实中间件的命令，写进跳过原因里便于直接复制执行。
 COMPOSE_HINT = "docker compose -f docker-compose.integration.yml up -d"
+
+#: Redis Cluster 集成栈的 6 个节点宿主端口（3 主 3 从，与编排文件一致）。
+#:
+#: 顺序即编排中 ``redis-cluster-1`` … ``redis-cluster-6`` 的端口。
+REDIS_CLUSTER_NODE_PORTS: tuple[int, ...] = (17001, 17002, 17003, 17004, 17005, 17006)
+
+#: 集群节点向客户端/对端广播自身地址时使用的环境变量名。
+#:
+#: 节点必须广播一个**同时**能被容器内对端与宿主机客户端访问的地址：
+#:
+#: * Linux（含 GitHub Actions runner）：默认值 ``172.31.240.1``（编排里固定子网的网关）
+#:   双向可达，无需设置；
+#: * Docker Desktop（Windows / macOS）：容器 IP 与子网网关都**不可**从宿主机访问，
+#:   必须显式设成宿主机局域网 IP，例如 ``MED_MEMORY_IT_CLUSTER_IP=192.168.1.20``
+#:   （可用 :func:`detect_host_address` 探测）。
+CLUSTER_ANNOUNCE_ENV = "MED_MEMORY_IT_CLUSTER_IP"
 
 
 @dataclass(frozen=True)
@@ -127,20 +144,29 @@ def _split_url(name: str, url: str) -> tuple[str, int]:
     return parts.hostname, port
 
 
+def _env_var_for(name: str) -> str:
+    """把服务名转成合法的覆盖用环境变量名（连字符转下划线）。"""
+    return f"{ENV_PREFIX}_{name.upper().replace('-', '_')}_URL"
+
+
 def _default_service(name: str, url: str) -> IntegrationService:
     """按内置连接串构造默认服务条目。"""
     host, port = _split_url(name, url)
-    return IntegrationService(name, url, host, port, f"{ENV_PREFIX}_{name.upper()}_URL")
+    return IntegrationService(name, url, host, port, _env_var_for(name))
 
 
-#: 集成测试依赖的三个服务及其默认地址（与 docker-compose.integration.yml 一一对应）。
+#: 集成测试依赖的服务及其默认地址（与 docker-compose.integration.yml 一一对应）。
 #:
-#: 宿主端口刻意**避开标准端口**（16379 / 13306 / 19200 而非 6379 / 3306 / 9200）：
-#: 开发机上常常已经跑着标准端口的中间件，集成栈用独立端口号隔离，互不干扰。
+#: 宿主端口刻意**避开标准端口**（16379 / 13306 / 19200 / 17001–17006 而非
+#: 6379 / 3306 / 9200）：开发机上常常已经跑着标准端口的中间件，
+#: 集成栈用独立端口号隔离，互不干扰。
 DEFAULT_SERVICES: tuple[IntegrationService, ...] = (
     _default_service("redis", "redis://localhost:16379/15"),
     _default_service("mysql", "mysql+pymysql://root:med@localhost:13306/med_memory"),
     _default_service("elasticsearch", "http://localhost:19200"),
+    # Redis Cluster 的地址只是**种子节点**（第一个节点），
+    # 完整启动节点列表由 cluster_startup_nodes() 展开。
+    _default_service("redis-cluster", "redis://localhost:17001/0"),
 )
 
 _DEFAULTS_BY_NAME = {service.name: service for service in DEFAULT_SERVICES}
@@ -182,6 +208,61 @@ def resolve_service(name: str, env: Mapping[str, str] | None = None) -> Integrat
         return base
     host, port = _split_url(name, raw)
     return IntegrationService(base.name, raw, host, port, base.env_var)
+
+
+def detect_host_address(timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS) -> str | None:
+    """探测宿主机在默认出口方向上的 IP 地址。
+
+    实现方式：建一个 UDP socket 并 ``connect`` 到一个不可路由的测试网段地址。
+    UDP 没有握手，``connect`` 只做一次路由查询、**不产生任何流量**，
+    因此离线环境同样可用，也不依赖任何第三方库。
+
+    Args:
+        timeout: socket 超时（秒）。
+
+    Returns:
+        形如 ``192.168.1.20`` 的宿主 IP；无默认路由等查询失败场景返回 ``None``。
+
+    Note:
+        返回值用于 Docker Desktop（Windows / macOS）场景下设置
+        :data:`CLUSTER_ANNOUNCE_ENV` —— 该场景容器 IP 与子网网关都不可从宿主机访问。
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(("192.0.2.1", 9))  # TEST-NET-1，仅用于触发路由查询
+        return str(sock.getsockname()[0])
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def cluster_startup_nodes(service: IntegrationService) -> list[dict[str, Any]]:
+    """把集群服务地址展开成 redis-py 的启动节点列表。
+
+    内置端口（:data:`REDIS_CLUSTER_NODE_PORTS`）与种子端口一致时展开为全部 6 个节点；
+    种子端口被环境变量改成别的值（对接自建集群）时退回「只有种子节点」——
+    redis-py 会从单个节点自动发现完整拓扑。
+
+    Args:
+        service: 名为 ``redis-cluster`` 的服务条目。
+
+    Returns:
+        形如 ``[{"host": "localhost", "port": 17001}, ...]`` 的启动节点列表，
+        可直接喂给 ``build_cluster_client``。
+
+    Raises:
+        ValidationError: ``service.name`` 不是 ``redis-cluster`` 时。
+    """
+    if service.name != "redis-cluster":
+        raise ValidationError(
+            f"cluster_startup_nodes expects the 'redis-cluster' service, got {service.name!r}"
+        )
+    ports = (
+        REDIS_CLUSTER_NODE_PORTS if service.port == REDIS_CLUSTER_NODE_PORTS[0] else (service.port,)
+    )
+    return [{"host": service.host, "port": port} for port in ports]
 
 
 def probe_tcp(host: str, port: int, *, timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS) -> bool:

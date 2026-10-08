@@ -244,27 +244,52 @@ mypy
 统一打 `integration` 标记，并且需要同时满足两个条件才会真正执行：
 
 1. 环境变量 `MED_MEMORY_IT=1`（显式开关）；
-2. 目标服务端口可连。
+2. 目标服务端口可连（Redis Cluster 还要求 `cluster_state:ok`，见下）。
 
 任一条件不满足时用例自动 `skip`，跳过原因里带可复制的启动命令。
 
 ```bash
-docker compose -f docker-compose.integration.yml up -d      # Redis + MySQL + Elasticsearch
+docker compose -f docker-compose.integration.yml up -d      # Redis + MySQL + ES + Redis Cluster(3主3从)
 MED_MEMORY_IT=1 pytest -m integration                       # 只跑真实后端用例
 docker compose -f docker-compose.integration.yml down -v
 ```
 
 | 项 | 说明 |
 |---|---|
-| 服务地址 | 默认 `redis://localhost:16379/15` · `mysql+pymysql://root:med@localhost:13306/med_memory` · `http://localhost:19200` |
+| 服务地址 | 默认 `redis://localhost:16379/15` · `mysql+pymysql://root:med@localhost:13306/med_memory` · `http://localhost:19200` · `redis://localhost:17001/0`（集群种子节点） |
 | 端口约定 | 宿主端口刻意避开标准端口（6379 / 3306 / 9200），避免与本机既有中间件抢占 |
-| 地址覆盖 | `MED_MEMORY_IT_REDIS_URL` / `MED_MEMORY_IT_MYSQL_URL` / `MED_MEMORY_IT_ELASTICSEARCH_URL` |
-| 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引） |
+| 地址覆盖 | `MED_MEMORY_IT_REDIS_URL` / `MED_MEMORY_IT_MYSQL_URL` / `MED_MEMORY_IT_ELASTICSEARCH_URL` / `MED_MEMORY_IT_REDIS_CLUSTER_URL` |
+| 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引、hash tag 同 slot、集群 pipeline 语义） |
 | MySQL 前置 | 需宿主侧自备 DBAPI 驱动（如 `pip install pymysql`），缺失时 MySQL 用例跳过 |
 | CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + 每周定时），不阻塞 `ci.yml` 必过门禁 |
 
 探针与开关逻辑在 `med_langchain_memory/testing/services.py`，只用标准库，
 因此「能不能跑」的判断本身不依赖任何中间件客户端。
+
+### Redis Cluster（三主三从）
+
+编排会起 6 个节点（宿主端口 17001–17006 + 集群总线端口 27001–27006），
+再由一次性容器 `redis-cluster-init` 组装成 3 主 3 从、16384 槽全覆盖的集群。
+
+集群节点必须向客户端与对端广播一个**双向可达**的地址（`--cluster-announce-ip`），
+否则客户端会拿到不可达的容器内网 IP，集群也永远停在 `cluster_state:fail`：
+
+| 环境 | 广播地址 |
+|---|---|
+| Linux（含 GitHub Actions runner） | 默认 `172.31.240.1`（编排固定子网的网关），双向可达，**无需设置** |
+| Docker Desktop（Windows / macOS） | 容器 IP 与子网网关都不可从宿主机访问，**必须**显式指定宿主机局域网 IP |
+
+```bash
+# Docker Desktop 用户：先探测本机局域网 IP，再起服务
+export MED_MEMORY_IT_CLUSTER_IP=$(python -c "import socket;s=socket.socket(2,2);s.connect(('192.0.2.1',9));print(s.getsockname()[0])")
+docker compose -f docker-compose.integration.yml up -d
+```
+
+> 该变量只影响「怎么起集群」，不影响用例本身：用例侧只需 `MED_MEMORY_IT_REDIS_CLUSTER_URL`。
+
+集群用例还覆盖了一条**替身测不出**的真机约束：redis-py 的集群客户端弃用了 `MULTI`
+（`pipeline(transaction=True)` 抛 `RedisClusterException`），因此 `RedisClusterMedHistory`
+必须覆写 `_pipeline()` 使用非事务 pipeline。详见 `docs/architecture.md` ADR-11。
 
 ---
 

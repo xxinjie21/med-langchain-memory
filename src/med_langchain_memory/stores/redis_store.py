@@ -11,7 +11,9 @@
   存会话命名空间、状态、消息条数与时间戳，条数用 ``HINCRBY`` 原子累加。
 
 一次 ``add_med_messages`` 的全部写命令（列表追加 + 元数据更新）打包进单个
-pipeline 事务提交，批量写只有一次网络往返。
+pipeline 提交，批量写只有一次网络往返。单机后端用 ``MULTI/EXEC`` 事务 pipeline
+（见 :meth:`RedisMedHistory._pipeline`）；集群子类因 redis-py 弃用集群事务而覆写为
+非事务 pipeline，键仍由 hash tag 固定在同一 slot。
 
 会话级 TTL 走 Redis 原生 ``EXPIRE``（两条键在同一 pipeline 事务内一起续期）：
 
@@ -36,6 +38,7 @@ from contextlib import contextmanager
 from typing import ClassVar, cast
 
 from redis import Redis
+from redis.client import Pipeline
 from redis.exceptions import RedisError
 
 from med_langchain_memory.domain.message import MedMessage, now_millis
@@ -128,11 +131,24 @@ class RedisMedHistory(MedChatMessageHistory):
     # ------------------------------------------------------------------ #
     # 存储原语
     # ------------------------------------------------------------------ #
+    def _pipeline(self) -> Pipeline:
+        """返回本后端使用的写命令 pipeline（单机为 MULTI/EXEC 事务 pipeline）。
+
+        抽成钩子是为了让集群子类覆写：redis-py 在集群模式下弃用了 MULTI
+        （``pipeline(transaction=True)`` 直接抛 ``RedisClusterException``）。
+        集群侧改用非事务 pipeline —— 键已由 hash tag 固定在同一 slot，
+        批量命令依旧只走一次网络往返。
+
+        Returns:
+            可 ``with`` 使用的 pipeline 对象；退出上下文时自动 ``reset()``。
+        """
+        return self._client.pipeline(transaction=True)
+
     def _append(self, messages: list[MedMessage]) -> None:
         """在单个 pipeline 事务内追加消息体并更新会话元数据哈希。"""
         payloads = [self._serializer.serialize_message(message) for message in messages]
         now = now_millis()
-        with self._guard("append"), self._client.pipeline(transaction=True) as pipe:
+        with self._guard("append"), self._pipeline() as pipe:
             pipe.rpush(self._messages_key, *payloads)
             pipe.hsetnx(self._meta_key, "created_at", str(now))
             pipe.hset(self._meta_key, mapping=self._meta_mapping(now))
@@ -164,7 +180,7 @@ class RedisMedHistory(MedChatMessageHistory):
         Raises:
             StorageError: redis 命令失败时。
         """
-        with self._guard("clear"), self._client.pipeline(transaction=True) as pipe:
+        with self._guard("clear"), self._pipeline() as pipe:
             pipe.delete(self._messages_key)
             pipe.delete(self._meta_key)
             pipe.execute()
@@ -194,7 +210,7 @@ class RedisMedHistory(MedChatMessageHistory):
 
         对不存在的键 ``EXPIRE`` 是空操作，因此空会话上调用同样安全。
         """
-        with self._guard("expire"), self._client.pipeline(transaction=True) as pipe:
+        with self._guard("expire"), self._pipeline() as pipe:
             pipe.expire(self._messages_key, ttl_seconds)
             pipe.expire(self._meta_key, ttl_seconds)
             pipe.execute()
@@ -259,7 +275,7 @@ class RedisMedHistory(MedChatMessageHistory):
 
     def _persist(self) -> None:
         """移除两条键上的过期时间（键不存在时为空操作）。"""
-        with self._guard("persist"), self._client.pipeline(transaction=True) as pipe:
+        with self._guard("persist"), self._pipeline() as pipe:
             pipe.persist(self._messages_key)
             pipe.persist(self._meta_key)
             pipe.execute()

@@ -572,6 +572,50 @@ class TestRobustness:
 
 
 # --------------------------------------------------------------------------- #
+# pipeline 语义
+# --------------------------------------------------------------------------- #
+class _RecordingClient:
+    """记录每次 ``pipeline()`` 是否开启事务的包装客户端。"""
+
+    def __init__(self, inner: fakeredis.FakeRedis) -> None:
+        self._inner = inner
+        self.transactions: list[bool] = []
+
+    def pipeline(self, transaction: bool = True, **kwargs: Any) -> Any:
+        """记录 ``transaction`` 取值后透传给内层替身。"""
+        self.transactions.append(transaction)
+        return self._inner.pipeline(transaction=transaction, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """其余命令一律透传给内层替身。"""
+        return getattr(self._inner, name)
+
+
+class TestPipelineSemantics:
+    """单机后端必须使用 ``MULTI/EXEC`` 事务 pipeline（与集群后端的差异点）。"""
+
+    def test_write_and_clear_use_transactional_pipeline(self) -> None:
+        """正向：写入与清空走的都是事务 pipeline。"""
+        recorder = _RecordingClient(fakeredis.FakeRedis())
+        history = RedisMedHistory(**NAMESPACE, client=recorder)  # type: ignore[arg-type]
+
+        history.add_med_messages([make_message()])
+        history.clear()
+
+        assert recorder.transactions == [True, True]
+
+    def test_ttl_commands_use_transactional_pipeline(self) -> None:
+        """正向：TTL 下发与取消（``PERSIST``）同样走事务 pipeline。"""
+        recorder = _RecordingClient(fakeredis.FakeRedis())
+        history = RedisMedHistory(**NAMESPACE, client=recorder)  # type: ignore[arg-type]
+
+        history.set_ttl(60)
+        history.set_ttl(None)
+
+        assert recorder.transactions == [True, True]
+
+
+# --------------------------------------------------------------------------- #
 # 工厂集成
 # --------------------------------------------------------------------------- #
 class TestFactoryIntegration:

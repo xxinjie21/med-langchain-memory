@@ -1,10 +1,17 @@
 """Redis 集群存储适配器 :class:`RedisClusterMedHistory`。
 
-与单机版 :class:`RedisMedHistory` 的唯一差异在**键布局**：用 ``{}`` 把
-``session_id`` 包成 Redis Cluster 的 hash tag，使得属于同一会话的两条键
-（消息 List 与元数据 Hash）都落在同一个 slot，从而满足集群事务 pipeline
-的单节点约束。存储逻辑（pipeline 批量写、元数据哈希累加、会话级 TTL 等）全部复用父类；
-同 slot 保证也让 ``EXPIRE`` 两条键可以放在同一个事务 pipeline 里下发。
+与单机版 :class:`RedisMedHistory` 有两处差异：
+
+1. **键布局**：用 ``{}`` 把 ``session_id`` 包成 Redis Cluster 的 hash tag，
+   使得属于同一会话的两条键（消息 List 与元数据 Hash）都落在同一个 slot，
+   从而满足集群 pipeline 的单节点约束；存储逻辑（批量写、元数据哈希累加、
+   会话级 TTL 等）全部复用父类。
+2. **pipeline 语义**：redis-py 在集群模式下弃用了 MULTI 事务
+   （``pipeline(transaction=True)`` 抛 ``RedisClusterException``），
+   故覆写 :meth:`RedisClusterMedHistory._pipeline` 改用非事务 pipeline。
+   该差异由真实集群集成用例
+   （``tests/test_integration/test_redis_cluster_live.py``）守护——
+   替身客户端不会暴露这个问题。
 
 ``client`` 必须是已建好的 :class:`redis.RedisCluster`（连接池由其构造函数配置，
 见 :func:`build_cluster_client`）；本类构造期**不发起任何网络请求**。
@@ -18,6 +25,7 @@ from __future__ import annotations
 from typing import Any, ClassVar, cast
 
 from redis import Redis, RedisCluster
+from redis.client import Pipeline
 from redis.cluster import ClusterNode
 
 from med_langchain_memory.exceptions import StorageError
@@ -120,3 +128,17 @@ class RedisClusterMedHistory(RedisMedHistory):
         self._meta_key = f"{tagged}{META_SUFFIX}"
         if ttl_seconds is not None:
             self.set_ttl(ttl_seconds)
+
+    def _pipeline(self) -> Pipeline:
+        """集群后端必须使用**非事务** pipeline。
+
+        redis-py 的集群客户端弃用了 MULTI：``pipeline(transaction=True)`` 会直接抛
+        ``RedisClusterException("transaction is deprecated in cluster mode")``，
+        而单机版的 ``clear()`` / ``_append()`` / ``_apply_ttl()`` / ``_persist()``
+        默认走的正是事务 pipeline。hash tag 已保证同会话两条键落在同一 slot，
+        因此非事务 pipeline 依旧把批量命令压成一次网络往返，语义不变。
+
+        Returns:
+            集群客户端上的非事务 pipeline。
+        """
+        return self._client.pipeline(transaction=False)

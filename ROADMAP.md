@@ -37,7 +37,7 @@ med-langchain-memory/
 │       └── release.yml             # tag 发布：版本守卫 + 构建 + 产物校验 + GitHub Release
 ├── protos/
 │   └── med_session.proto           # 统一序列化协议（跨语言规范源）
-├── docker-compose.integration.yml  # 集成测试用 Redis/MySQL/ES 本地编排
+├── docker-compose.integration.yml  # 集成测试本地编排：Redis/MySQL/ES + Redis Cluster 三主三从
 ├── src/med_langchain_memory/
 │   ├── __init__.py
 │   ├── config.py                   # 全局配置（pydantic-settings）
@@ -164,9 +164,11 @@ med-langchain-memory/
 | D36 | MySQL 适配器 | `MySQLMedHistory` 注册 `mysql` 后端：`crc32(session_id) % 16` 分表写入 + `med_session` 会话行 upsert + `ordinal` 会话内保序 | `feat(stores): implement mysql sharded store with ordered writes` |
 | D37 | 真实中间件集成测试 | `docker-compose.integration.yml` 三服务编排 + `testing/services.py`（纯标准库 TCP 探针 + `MED_MEMORY_IT` 显式开关）+ `tests/test_integration/`（复用行为基准套件，打 `integration` 标记，默认跳过）+ 可选工作流 `integration.yml` | `feat(stores): add opt-in real middleware integration test harness` |
 | D38 | 发布流水线 | `release.py`（纯标准库发布守卫：tag ↔ pyproject ↔ `__version__` 三方比对 + sdist/wheel 完整性与元数据版本校验 + CLI）+ `release.yml`（`v*` tag 触发：守卫 → 全量测试 → 构建 → 产物校验 → GitHub Release，PyPI 走 OIDC 可信发布且默认关闭）+ `tests/test_release.py`、`tests/test_ci/test_release_workflow.py` | `feat: daily iteration D38 - tag-driven release pipeline with version guard` |
+| D39 | Redis Cluster 真机用例 | `docker-compose.integration.yml` 增三主三从 6 节点 + 一次性初始化容器（固定子网 + `MED_MEMORY_IT_CLUSTER_IP` 广播地址）；`testing/services.py` 增 `redis-cluster` 服务、`cluster_startup_nodes`、`detect_host_address`；`tests/test_integration/test_redis_cluster_live.py`（复用行为基准套件 + slot 亲和 + **真机回归：集群弃用 `MULTI`**）；`RedisClusterMedHistory._pipeline()` 覆写为非事务 pipeline | `feat: daily iteration D39 - real redis cluster integration tests` |
 
-> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① Redis Cluster 真机用例（需三主三从编排）；
-> ② 集成测试纳入夜间 CI 并上报趋势；③ 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`）。
+> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 集成测试纳入夜间 CI 并上报趋势；
+> ② 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`）；
+> ③ Redis Cluster 故障转移用例（主节点下线 → 从节点晋升后读写可用）。
 
 ---
 

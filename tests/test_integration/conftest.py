@@ -10,6 +10,11 @@
 
 用例本身复用 ``tests/test_stores/behavior.py`` 的跨后端行为基准套件，
 与 fakeredis / SQLite 内存库 / fake ES 的单测共享同一份语义契约。
+
+Redis Cluster 夹具（``redis_cluster_live``）比单机版多两道关：
+
+* 启动节点列表由 ``cluster_startup_nodes()`` 从种子地址展开；
+* 必须轮询 ``CLUSTER INFO`` 等到 ``cluster_state:ok``——端口可连不等于集群可用。
 """
 
 from __future__ import annotations
@@ -32,11 +37,15 @@ if str(_STORES_TESTS_DIR) not in sys.path:
 from med_langchain_memory.testing import (  # noqa: E402
     IntegrationService,
     check_service,
+    cluster_startup_nodes,
     resolve_service,
 )
 
 #: 等待容器冷启动就绪的上限（秒）：Redis 秒级，MySQL / ES 需数十秒。
 WAIT_SECONDS = 120.0
+
+#: Redis Cluster 组集群 + 收敛的上限（秒）：6 节点冷启动比单机慢。
+CLUSTER_WAIT_SECONDS = 180.0
 
 #: MySQL / ES 客户端握手重试间隔（秒）。
 CONNECT_RETRY_INTERVAL_SECONDS = 1.0
@@ -79,6 +88,12 @@ def es_service() -> IntegrationService:
 
 
 @pytest.fixture(scope="session")
+def redis_cluster_service() -> IntegrationService:
+    """真实 Redis Cluster 种子节点地址（不可用时跳过）。"""
+    return require_service("redis-cluster")
+
+
+@pytest.fixture(scope="session")
 def redis_live(redis_service: IntegrationService) -> Iterator[Any]:
     """真实 Redis 客户端（指向集成测试专用 DB，收尾清空）。"""
     redis_module = pytest.importorskip("redis", reason="redis is an optional dependency")
@@ -89,6 +104,39 @@ def redis_live(redis_service: IntegrationService) -> Iterator[Any]:
         pytest.skip(f"{redis_service.describe()} is not a usable redis server: {exc}")
     yield client
     client.flushdb()
+    client.close()
+
+
+@pytest.fixture(scope="session")
+def redis_cluster_live(redis_cluster_service: IntegrationService) -> Iterator[Any]:
+    """真实 Redis Cluster 客户端（等待集群收敛为 ``ok``，收尾关闭连接）。
+
+    集群可能「端口已开但仍在组集群」，因此不能只靠 TCP 探针：
+    必须轮询 ``CLUSTER INFO`` 直到 ``cluster_state:ok``，否则用例会在
+    16384 槽尚未分配完时误判失败。
+    """
+    redis_module = pytest.importorskip("redis", reason="redis is an optional dependency")
+
+    from med_langchain_memory.stores.redis_cluster_store import build_cluster_client
+
+    client = build_cluster_client(cluster_startup_nodes(redis_cluster_service))
+    deadline = time.monotonic() + CLUSTER_WAIT_SECONDS
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            if client.cluster_info().get("cluster_state") == "ok":
+                last_error = None
+                break
+        except redis_module.exceptions.RedisError as exc:  # 节点仍在组集群
+            last_error = exc
+        time.sleep(CONNECT_RETRY_INTERVAL_SECONDS)
+    else:
+        client.close()
+        pytest.skip(
+            f"{redis_cluster_service.describe()} did not reach cluster_state=ok "
+            f"within {CLUSTER_WAIT_SECONDS:.0f}s ({last_error})"
+        )
+    yield client
     client.close()
 
 

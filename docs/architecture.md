@@ -68,7 +68,7 @@ LLM 本身无状态，对话的「记忆」必须由外部存储承担。本库�
 │  └─ *_repository.py  会话索引 / 消息仓储（补 history 回答不了的列表查询）  │
 ├──────────────────────────────────────────────────────────────────────┤
 │  testing/        测试支撑层（纯标准库，不参与生产链路）                 │
-│  └─ services.py  集成测试服务探针 + 显式开关（TCP 可达性判定）           │
+│  └─ services.py  集成测试服务探针 + 显式开关 + 集群启动节点/广播地址解析  │
 ├──────────────────────────────────────────────────────────────────────┤
 │  serde/          序列化层：Serializer 抽象 + ProtobufSerializer          │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -241,6 +241,41 @@ release.py --dist dist --expected-version "${{ github.ref_name }}"   # 构建后
 与模块保持同步——为此 `tests/test_ci/test_release_workflow.py` 直接调用
 `build_parser()` 断言「工作流用到的选项真实存在」。
 
+### ADR-11 · Redis 集群用 hash tag + 非事务 pipeline，并用真机用例守护
+
+**决策**：`RedisClusterMedHistory` 与单机版有两处刻意差异：
+
+1. 键布局用 `{session_id}` 作 hash tag，使同一会话的 `:messages` 与 `:meta`
+   落在同一 slot（租户 / 科室**不**进 tag，否则整个租户塌缩到单一 slot）；
+2. 覆写 `_pipeline()` 返回 `pipeline(transaction=False)`。
+
+配套新增真机套件 `tests/test_integration/test_redis_cluster_live.py`，
+以 `docker-compose.integration.yml` 里的三主三从编排为环境。
+
+**理由**：
+
+* redis-py 的集群客户端**弃用了 `MULTI`**：`pipeline(transaction=True)` 直接抛
+  `RedisClusterException("transaction is deprecated in cluster mode")`。
+  单机实现的 `clear()` / `_append()` / `_apply_ttl()` / `_persist()` 默认都走事务
+  pipeline，因此在真集群上会**整体不可用**（`clear()` 首当其冲）；
+* 这类缺陷**替身永远测不出**：`fakeredis.FakeRedis` 没有集群语义，
+  集群单测传入的是普通替身，事务 pipeline 一路绿灯。真机用例是唯一防线，
+  因此套件里保留一条「本集群确实拒绝 `transaction=True`」的断言，
+  一旦 redis-py 改变行为即红灯，提示重新评估该适配；
+* hash tag 已把两条键固定在同一 slot，非事务 pipeline 依旧把批量命令压成
+  一次网络往返，只放弃 `MULTI/EXEC` 的原子性——集群模式下本来也换不来跨 slot 原子性。
+
+**代价**：集群写入不再有事务原子性（`RPUSH` 与 `HSET` 之间可能被其它客户端观测到），
+需由上层会话锁（`runnable/lock.py`）串行化；集群集成栈需要 6 个容器 + 1 个初始化容器，
+且必须解决「节点广播地址要双向可达」的网络问题（见下）。
+
+**广播地址**：集群节点必须广播一个**同时**能被容器内对端与宿主机客户端访问的地址
+（`--cluster-announce-ip`），否则客户端拿到不可达的容器内网 IP、节点间 gossip 也断链，
+集群永远停在 `cluster_state:fail`。编排用 `MED_MEMORY_IT_CLUSTER_IP` 控制，
+默认取固定子网网关 `172.31.240.1`（Linux / CI runner 双向可达）；
+Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿主机访问，
+必须显式覆盖为宿主机局域网 IP。`testing/services.py::detect_host_address()` 可探测该地址。
+
 ---
 
 ## 5. 并发与可用性
@@ -249,7 +284,7 @@ release.py --dist dist --expected-version "${{ github.ref_name }}"   # 构建后
 |---|---|---|
 | 会话互斥 | `RedisSessionLock`：`SET NX PX` + 看门狗续期 + 事务化 compare-and-delete | 无 Redis 时 `LocalSessionLock`（进程级按锁键共享互斥量） |
 | 存储容错 | `CircuitBreaker`（失败计数打开 / 恢复窗口半开 / 成功阈值闭合） | 主备双写降级；全挂抛 `FallbackExhaustedError` |
-| 单会话写入 | 一次 `add_messages` 打包进单个 pipeline 事务（Redis） | 非事务后端按序追加，失败即抛 `StorageError` |
+| 单会话写入 | 一次 `add_messages` 打包进单个 pipeline（Redis 单机为 `MULTI/EXEC` 事务） | 集群后端用非事务 pipeline（hash tag 保证同 slot）；无 pipeline 的后端按序追加，失败即抛 `StorageError` |
 
 > 本地锁降级仅在单进程内有效，多实例部署必须配置 Redis；这是可用性降级而非一致性保证。
 
@@ -292,7 +327,8 @@ release.py --dist dist --expected-version "${{ github.ref_name }}"   # 构建后
 | 无真实依赖 | 全量单测不需要真实 Redis / MySQL / ES，CI 无需起容器 |
 | 行为基准套件 | `tests/test_stores/behavior.py` 供各后端复用，保证语义一致 |
 | 真实后端集成 | `tests/test_integration/` + `integration` 标记：`MED_MEMORY_IT=1` 且服务可达才执行，否则跳过；同一份行为基准套件在真机上再跑一遍 |
-| 集成环境编排 | `docker-compose.integration.yml`（Redis / MySQL / ES 三服务带健康检查）；可选工作流 `.github/workflows/integration.yml` |
+| 真机守护的缺陷 | 集群弃用 `MULTI`（ES 索引模板、MySQL 同毫秒保序同理）——替身测不出的服务端行为由真机套件兜底 |
+| 集成环境编排 | `docker-compose.integration.yml`（Redis / MySQL / ES 带健康检查 + Redis Cluster 三主三从 6 节点 + 一次性初始化容器）；可选工作流 `.github/workflows/integration.yml` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |

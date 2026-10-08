@@ -5,16 +5,35 @@
 #   MED_MEMORY_IT=1 pytest -m integration
 #   docker compose -f docker-compose.integration.yml down -v
 #
-# 三个服务的地址与 src/med_langchain_memory/testing/services.py 的内置默认值一一对应：
+# 四个服务的地址与 src/med_langchain_memory/testing/services.py 的内置默认值一一对应：
 #   redis://localhost:16379/15
 #   mysql+pymysql://root:med@localhost:13306/med_memory
 #   http://localhost:19200
+#   redis://localhost:17001/0          （Redis Cluster 种子节点）
 #
-# 刻意使用**非默认宿主端口**（16379 / 13306 / 19200）：开发机上常常已经跑着
-# 标准端口（6379 / 3306 / 9200）的中间件，占用会直接导致 `up` 失败。
+# 刻意使用**非默认宿主端口**（16379 / 13306 / 19200 / 17001–17006）：开发机上常常
+# 已经跑着标准端口（6379 / 3306 / 9200）的中间件，占用会直接导致 `up` 失败。
 # 用独立端口号隔离，集成栈与本机既有服务互不干扰。
 #
-# CI 侧的可选自动化见 .github/workflows/integration.yml（以服务容器起 Redis 与 Elasticsearch）。
+# ---------------------------------------------------------------------------
+# Redis Cluster（三主三从，共 6 个节点）
+# ---------------------------------------------------------------------------
+# 集群节点必须向客户端与对端广播一个**双向可达**的地址（`--cluster-announce-ip`），
+# 否则客户端会拿到不可达的容器内网 IP。这里用 `MED_MEMORY_IT_CLUSTER_IP` 控制：
+#
+#   * Linux（含 GitHub Actions runner）：默认 172.31.240.1（本编排固定子网的网关）
+#     容器与宿主机双向可达，**无需设置**；
+#   * Docker Desktop（Windows / macOS）：容器 IP 与子网网关都不可从宿主机访问，
+#     必须显式指定宿主机局域网 IP，例如：
+#       PowerShell:  $env:MED_MEMORY_IT_CLUSTER_IP = "<本机局域网 IP>"
+#       bash:        export MED_MEMORY_IT_CLUSTER_IP=<本机局域网 IP>
+#     可用 `python -c "import socket;s=socket.socket(2,2);s.connect(('192.0.2.1',9));print(s.getsockname()[0])"`
+#     或 med_langchain_memory.testing.detect_host_address() 探测。
+#
+# 每个节点映射两个端口：客户端端口（1700x）与集群总线端口（2700x）。
+# 集群由 redis-cluster-init 一次性初始化（3 主 3 从，16384 槽全覆盖）。
+#
+# CI 侧的可选自动化见 .github/workflows/integration.yml。
 # Redis 单独使用 DB 15，避免与开发者本机其它数据混用。
 # MySQL 需要宿主侧自备 DBAPI 驱动（如 `pip install pymysql`），
 # 否则 MySQL 集成用例会以「驱动缺失」跳过——本编排文件本身不受影响。
@@ -59,3 +78,241 @@ services:
       interval: 10s
       timeout: 5s
       retries: 24
+
+  redis-cluster-1:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-node-timeout
+      - "5000"
+      - --cluster-port
+      - "16379"
+      - --cluster-announce-ip
+      - ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}
+      - --cluster-announce-port
+      - "17001"
+      - --cluster-announce-bus-port
+      - "27001"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+    ports:
+      - "17001:6379"
+      - "27001:16379"
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis-cluster-2:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-node-timeout
+      - "5000"
+      - --cluster-port
+      - "16379"
+      - --cluster-announce-ip
+      - ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}
+      - --cluster-announce-port
+      - "17002"
+      - --cluster-announce-bus-port
+      - "27002"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+    ports:
+      - "17002:6379"
+      - "27002:16379"
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis-cluster-3:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-node-timeout
+      - "5000"
+      - --cluster-port
+      - "16379"
+      - --cluster-announce-ip
+      - ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}
+      - --cluster-announce-port
+      - "17003"
+      - --cluster-announce-bus-port
+      - "27003"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+    ports:
+      - "17003:6379"
+      - "27003:16379"
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis-cluster-4:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-node-timeout
+      - "5000"
+      - --cluster-port
+      - "16379"
+      - --cluster-announce-ip
+      - ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}
+      - --cluster-announce-port
+      - "17004"
+      - --cluster-announce-bus-port
+      - "27004"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+    ports:
+      - "17004:6379"
+      - "27004:16379"
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis-cluster-5:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-node-timeout
+      - "5000"
+      - --cluster-port
+      - "16379"
+      - --cluster-announce-ip
+      - ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}
+      - --cluster-announce-port
+      - "17005"
+      - --cluster-announce-bus-port
+      - "27005"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+    ports:
+      - "17005:6379"
+      - "27005:16379"
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis-cluster-6:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-node-timeout
+      - "5000"
+      - --cluster-port
+      - "16379"
+      - --cluster-announce-ip
+      - ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}
+      - --cluster-announce-port
+      - "17006"
+      - --cluster-announce-bus-port
+      - "27006"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+    ports:
+      - "17006:6379"
+      - "27006:16379"
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # 一次性初始化容器：等 6 个节点就绪后组集群（3 主 3 从，16384 槽全覆盖）。
+  # 用广播地址而非服务名连接——节点间 gossip 用的就是广播地址，保持一致最稳。
+  redis-cluster-init:
+    image: redis:7-alpine
+    depends_on:
+      redis-cluster-1:
+        condition: service_healthy
+      redis-cluster-2:
+        condition: service_healthy
+      redis-cluster-3:
+        condition: service_healthy
+      redis-cluster-4:
+        condition: service_healthy
+      redis-cluster-5:
+        condition: service_healthy
+      redis-cluster-6:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - >-
+        redis-cli --cluster create
+        ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}:17001
+        ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}:17002
+        ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}:17003
+        ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}:17004
+        ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}:17005
+        ${MED_MEMORY_IT_CLUSTER_IP:-172.31.240.1}:17006
+        --cluster-replicas 1 --cluster-yes
+    networks:
+      - cluster
+    restart: "no"
+
+networks:
+  # 固定子网：网关地址（172.31.240.1）即 Linux 下集群节点广播的默认地址。
+  cluster:
+    ipam:
+      config:
+        - subnet: 172.31.240.0/24
