@@ -165,10 +165,11 @@ med-langchain-memory/
 | D37 | 真实中间件集成测试 | `docker-compose.integration.yml` 三服务编排 + `testing/services.py`（纯标准库 TCP 探针 + `MED_MEMORY_IT` 显式开关）+ `tests/test_integration/`（复用行为基准套件，打 `integration` 标记，默认跳过）+ 可选工作流 `integration.yml` | `feat(stores): add opt-in real middleware integration test harness` |
 | D38 | 发布流水线 | `release.py`（纯标准库发布守卫：tag ↔ pyproject ↔ `__version__` 三方比对 + sdist/wheel 完整性与元数据版本校验 + CLI）+ `release.yml`（`v*` tag 触发：守卫 → 全量测试 → 构建 → 产物校验 → GitHub Release，PyPI 走 OIDC 可信发布且默认关闭）+ `tests/test_release.py`、`tests/test_ci/test_release_workflow.py` | `feat: daily iteration D38 - tag-driven release pipeline with version guard` |
 | D39 | Redis Cluster 真机用例 | `docker-compose.integration.yml` 增三主三从 6 节点 + 一次性初始化容器（固定子网 + `MED_MEMORY_IT_CLUSTER_IP` 广播地址）；`testing/services.py` 增 `redis-cluster` 服务、`cluster_startup_nodes`、`detect_host_address`；`tests/test_integration/test_redis_cluster_live.py`（复用行为基准套件 + slot 亲和 + **真机回归：集群弃用 `MULTI`**）；`RedisClusterMedHistory._pipeline()` 覆写为非事务 pipeline | `feat: daily iteration D39 - real redis cluster integration tests` |
+| D40 | 集群故障转移演练 | `testing/cluster.py`（纯标准库：`CLUSTER NODES` 解析 `parse_cluster_nodes`/`parse_slots`、确定性目标选择 `plan_failover`→`FailoverPlan`、端口↔容器名映射 `cluster_node_index`/`cluster_container_name`、可注入时钟的 `wait_until`、可注入执行器的 `DockerContainerController`/`run_docker`）；`tests/test_integration/test_redis_cluster_failover.py`（停主节点 → 从节点晋升 → 读写可用 → 原主恢复收敛）；编排 6 节点显式固定 `container_name` | `feat: daily iteration D40 - redis cluster failover drill` |
 
 > 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 集成测试纳入夜间 CI 并上报趋势；
 > ② 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`）；
-> ③ Redis Cluster 故障转移用例（主节点下线 → 从节点晋升后读写可用）。
+> ③ MySQL 8 的 `pymysql` 驱动纳入 dev extras，让 MySQL 真机用例在 CI 默认可跑。
 
 ---
 

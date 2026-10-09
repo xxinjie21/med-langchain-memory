@@ -33,6 +33,10 @@
 # 每个节点映射两个端口：客户端端口（1700x）与集群总线端口（2700x）。
 # 集群由 redis-cluster-init 一次性初始化（3 主 3 从，16384 槽全覆盖）。
 #
+# 每个节点都显式声明 container_name（med-memory-integration-redis-cluster-N）：
+# 故障转移演练用例要用 `docker stop/start <容器名>` 精确停掉某一个节点，
+# 默认的 `<工程名>-<服务名>-1` 命名会随 compose 调用方式漂移，不能作为稳定句柄。
+#
 # CI 侧的可选自动化见 .github/workflows/integration.yml。
 # Redis 单独使用 DB 15，避免与开发者本机其它数据混用。
 # MySQL 需要宿主侧自备 DBAPI 驱动（如 `pip install pymysql`），
@@ -80,6 +84,7 @@ services:
       retries: 24
 
   redis-cluster-1:
+    container_name: med-memory-integration-redis-cluster-1
     image: redis:7-alpine
     command:
       - redis-server
@@ -113,6 +118,7 @@ services:
       retries: 12
 
   redis-cluster-2:
+    container_name: med-memory-integration-redis-cluster-2
     image: redis:7-alpine
     command:
       - redis-server
@@ -146,6 +152,7 @@ services:
       retries: 12
 
   redis-cluster-3:
+    container_name: med-memory-integration-redis-cluster-3
     image: redis:7-alpine
     command:
       - redis-server
@@ -179,6 +186,7 @@ services:
       retries: 12
 
   redis-cluster-4:
+    container_name: med-memory-integration-redis-cluster-4
     image: redis:7-alpine
     command:
       - redis-server
@@ -212,6 +220,7 @@ services:
       retries: 12
 
   redis-cluster-5:
+    container_name: med-memory-integration-redis-cluster-5
     image: redis:7-alpine
     command:
       - redis-server
@@ -245,6 +254,7 @@ services:
       retries: 12
 
   redis-cluster-6:
+    container_name: med-memory-integration-redis-cluster-6
     image: redis:7-alpine
     command:
       - redis-server

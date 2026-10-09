@@ -68,7 +68,8 @@ LLM 本身无状态，对话的「记忆」必须由外部存储承担。本库�
 │  └─ *_repository.py  会话索引 / 消息仓储（补 history 回答不了的列表查询）  │
 ├──────────────────────────────────────────────────────────────────────┤
 │  testing/        测试支撑层（纯标准库，不参与生产链路）                 │
-│  └─ services.py  集成测试服务探针 + 显式开关 + 集群启动节点/广播地址解析  │
+│  ├─ services.py  集成测试服务探针 + 显式开关 + 集群启动节点/广播地址解析  │
+│  └─ cluster.py   集群拓扑解析 + 故障转移目标选择 + docker 容器控制 + 轮询  │
 ├──────────────────────────────────────────────────────────────────────┤
 │  serde/          序列化层：Serializer 抽象 + ProtobufSerializer          │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -278,6 +279,40 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 
 ---
 
+### ADR-12 · 高可用靠「可复现的故障转移演练」验证，而非靠拓扑断言
+
+**决策**：新增破坏性集成用例 `tests/test_integration/test_redis_cluster_failover.py`：
+停掉一个主节点容器 → 等到其从节点晋升并接管槽位 → 用**存活节点**重建客户端验证读写 →
+把节点拉回并等到集群重新收敛为 3 主 16384 槽全覆盖。
+
+演练的「非 Redis 部分」全部下沉到 `testing/cluster.py`（纯标准库）：
+
+| 关注点 | 实现 | 为什么下沉 |
+|---|---|---|
+| 拓扑解析 | `parse_cluster_nodes` / `parse_slots` | 解析规则是纯函数，可在无 Redis 环境完整单测 |
+| 目标选择 | `plan_failover` → `FailoverPlan` | 选择规则必须确定性可复现，否则演练不可回归 |
+| 节点定位 | `cluster_node_index` / `cluster_container_name` | 端口 ↔ 容器名映射是纯计算，且要与编排文件对齐 |
+| 环境破坏 | `DockerContainerController` | 执行器可注入，编排逻辑用假执行器即可单测 |
+| 收敛等待 | `wait_until`（时钟与 sleep 可注入） | 真机要等几十秒，离线单测必须零等待 |
+
+**理由**：
+
+* 「3 主 3 从、16384 槽全覆盖」只是**静态拓扑断言**，证明不了主节点消失后集群还能
+  自动收敛——而这恰恰是「高可用」的全部含义。只有真停一个容器才能覆盖；
+* 把演练逻辑写成 `testing/cluster.py` 的纯函数后，**失败模式可以离线复现**：
+  「只有主没有从」「从节点链路断开」「主节点已标记 fail」「端口不属于本编排」
+  都有对应的离线用例，真机用例只负责最后那一步不可替代的破坏与观察；
+* 读取拓扑刻意用 `execute_command("CLUSTER", "NODES")` 而非 redis-py 的
+  `cluster_nodes()`：后者只为字面量 `"CLUSTER NODES"` 注册了解析回调并返回
+  **按 IP 为键的 dict**（同广播 IP 的多节点会互相覆盖），拿原始文本才与自研解析口径一致。
+
+**代价**：用例会主动破坏环境，必须保证恢复（恢复动作放在 `finally`，
+并在恢复后强制 `nodes_manager.initialize()` 刷新会话级客户端的槽位映射）；
+6 个节点在编排里必须显式固定 `container_name`，否则 `docker stop` 会打错目标；
+演练使集成套件整体耗时增加约 1 分钟。
+
+---
+
 ## 5. 并发与可用性
 
 | 机制 | 实现 | 降级路径 |
@@ -328,6 +363,7 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 | 行为基准套件 | `tests/test_stores/behavior.py` 供各后端复用，保证语义一致 |
 | 真实后端集成 | `tests/test_integration/` + `integration` 标记：`MED_MEMORY_IT=1` 且服务可达才执行，否则跳过；同一份行为基准套件在真机上再跑一遍 |
 | 真机守护的缺陷 | 集群弃用 `MULTI`（ES 索引模板、MySQL 同毫秒保序同理）——替身测不出的服务端行为由真机套件兜底 |
+| 高可用演练 | `test_redis_cluster_failover.py` 停掉主节点容器验证从节点晋升 + 读写可用 + 自动收敛；编排逻辑在 `testing/cluster.py` 中纯函数化，离线可测 |
 | 集成环境编排 | `docker-compose.integration.yml`（Redis / MySQL / ES 带健康检查 + Redis Cluster 三主三从 6 节点 + 一次性初始化容器）；可选工作流 `.github/workflows/integration.yml` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |

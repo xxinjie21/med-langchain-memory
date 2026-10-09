@@ -115,7 +115,7 @@ src/med_langchain_memory/
 ├── privacy/       # 字段级正则脱敏（手机号 / 身份证 / 病历号 / 床号）
 ├── runnable/      # 医疗增强 Runnable：租户隔离、Token 裁剪、LLM 摘要、并发锁、降级熔断
 ├── api/           # FastAPI 会话管理接口
-├── testing/       # 集成测试支撑：真实中间件探针与开关（纯标准库，不参与生产链路）
+├── testing/       # 集成测试支撑：真实中间件探针、开关与集群故障转移演练（纯标准库）
 ├── config.py      # 全局配置（pydantic-settings）
 └── exceptions.py  # 统一异常体系
 ```
@@ -259,7 +259,7 @@ docker compose -f docker-compose.integration.yml down -v
 | 服务地址 | 默认 `redis://localhost:16379/15` · `mysql+pymysql://root:med@localhost:13306/med_memory` · `http://localhost:19200` · `redis://localhost:17001/0`（集群种子节点） |
 | 端口约定 | 宿主端口刻意避开标准端口（6379 / 3306 / 9200），避免与本机既有中间件抢占 |
 | 地址覆盖 | `MED_MEMORY_IT_REDIS_URL` / `MED_MEMORY_IT_MYSQL_URL` / `MED_MEMORY_IT_ELASTICSEARCH_URL` / `MED_MEMORY_IT_REDIS_CLUSTER_URL` |
-| 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引、hash tag 同 slot、集群 pipeline 语义） |
+| 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引、hash tag 同 slot、集群 pipeline 语义、集群故障转移） |
 | MySQL 前置 | 需宿主侧自备 DBAPI 驱动（如 `pip install pymysql`），缺失时 MySQL 用例跳过 |
 | CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + 每周定时），不阻塞 `ci.yml` 必过门禁 |
 
@@ -290,6 +290,24 @@ docker compose -f docker-compose.integration.yml up -d
 集群用例还覆盖了一条**替身测不出**的真机约束：redis-py 的集群客户端弃用了 `MULTI`
 （`pipeline(transaction=True)` 抛 `RedisClusterException`），因此 `RedisClusterMedHistory`
 必须覆写 `_pipeline()` 使用非事务 pipeline。详见 `docs/architecture.md` ADR-11。
+
+### 故障转移演练（破坏性用例）
+
+`tests/test_integration/test_redis_cluster_failover.py` 是唯一会**主动破坏环境**的用例：
+它用 `docker stop` 停掉一个主节点，验证集群自动把其从节点晋升为新主、读写仍可用，
+再 `docker start` 把节点拉回并等到集群重新收敛为 3 主 16384 槽全覆盖。
+无论断言成败都会在 `finally` 里恢复环境，避免把降级集群留给后续用例。
+
+演练依赖两个前提：
+
+| 前提 | 说明 |
+|---|---|
+| 显式容器名 | 6 个节点在编排里固定为 `med-memory-integration-redis-cluster-N`，演练据此定位目标节点（默认命名会漂移） |
+| `docker` CLI | 宿主机需有可用的 `docker` 命令；缺失时该模块整体跳过 |
+
+拓扑解析与目标选择（`CLUSTER NODES` 文本解析、主/从配对、容器名映射、可注入时钟的轮询）
+全部抽在 `med_langchain_memory/testing/cluster.py` 里，**纯标准库**，
+因此这部分逻辑在没有 Docker 与 Redis 的机器上也有完整的离线单测。
 
 ---
 
@@ -331,7 +349,7 @@ python -m med_langchain_memory.release --dist dist --expected-version v0.1.0   #
 
 ## 每日迭代节奏
 
-项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线）。
+项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练）。
 
 ---
 

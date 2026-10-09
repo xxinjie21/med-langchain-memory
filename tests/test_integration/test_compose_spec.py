@@ -10,7 +10,8 @@
 * Elasticsearch 必须单节点且关闭安全插件（本地集成测试前提）；
 * MySQL 库名必须与默认连接串一致；
 * 集群节点必须开集群模式、广播地址可控、总线端口成对映射，
-  且初始化容器按 3 主 3 从组装集群。
+  且初始化容器按 3 主 3 从组装集群；
+* 每个集群节点必须显式固定 ``container_name``（故障转移演练要用它停/起节点）。
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from med_langchain_memory.testing import (
     CLUSTER_ANNOUNCE_ENV,
     DEFAULT_SERVICES,
     REDIS_CLUSTER_NODE_PORTS,
+    cluster_container_name,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -218,3 +220,15 @@ class TestRedisClusterTopology:
         text = read_compose()
         assert re.search(rf"^\s{{2}}{CLUSTER_NETWORK}:\s*$", text, re.MULTILINE)
         assert text.count(f"- {CLUSTER_NETWORK}") == len(CLUSTER_NODE_SERVICES) + 1
+
+    def test_every_node_pins_a_stable_container_name(self) -> None:
+        """正向：每个节点显式声明 ``container_name``，与 ``cluster_container_name`` 一致。
+
+        故障转移演练要用 ``docker stop/start <容器名>`` 精确定位某一个节点；
+        compose 默认生成的 ``<工程名>-<服务名>-1`` 会随调用方式漂移，
+        不能作为稳定句柄，因此必须显式固定。
+        """
+        text = read_compose()
+        for index in range(1, len(REDIS_CLUSTER_NODE_PORTS) + 1):
+            name = cluster_container_name(index)
+            assert f"container_name: {name}" in text, f"{name} is not pinned in the compose file"
