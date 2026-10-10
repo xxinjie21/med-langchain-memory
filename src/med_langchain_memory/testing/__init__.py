@@ -3,8 +3,9 @@
 本包**不参与生产链路**（``med_langchain_memory/__init__.py`` 不导入它），
 仅被 ``tests/test_integration/`` 使用，且只依赖标准库。
 
-公开符号见 :mod:`med_langchain_memory.testing.services`（服务探测与开关）与
-:mod:`med_langchain_memory.testing.cluster`（集群拓扑解析与故障转移演练）。
+公开符号见 :mod:`med_langchain_memory.testing.services`（服务探测与开关）、
+:mod:`med_langchain_memory.testing.cluster`（集群拓扑解析与故障转移演练）与
+:mod:`med_langchain_memory.testing.trend`（JUnit 报告汇总与趋势对比）。
 """
 
 from __future__ import annotations
@@ -46,26 +47,52 @@ from .services import (
     resolve_service,
     wait_for_service,
 )
+from .trend import (
+    BASELINE_REPORT_NAME,
+    DEFAULT_REPORTS_DIR,
+    DEFAULT_SLOWEST_LIMIT,
+    JUNIT_REPORT_NAME,
+    TREND_SUMMARY_NAME,
+    CaseResult,
+    SuiteReport,
+    TrendReport,
+    build_parser,
+    build_trend,
+    main,
+    parse_junit_report,
+    parse_junit_xml,
+    render_markdown,
+)
 
 __all__ = [
+    "BASELINE_REPORT_NAME",
     "CLUSTER_ANNOUNCE_ENV",
     "COMPOSE_HINT",
     "COMPOSE_PROJECT_NAME",
     "DEFAULT_DOCKER_TIMEOUT_SECONDS",
     "DEFAULT_POLL_INTERVAL_SECONDS",
     "DEFAULT_PROBE_TIMEOUT_SECONDS",
+    "DEFAULT_REPORTS_DIR",
     "DEFAULT_SERVICES",
+    "DEFAULT_SLOWEST_LIMIT",
     "DEFAULT_WAIT_INTERVAL_SECONDS",
     "DEFAULT_WAIT_SECONDS",
     "ENV_PREFIX",
     "FAILOVER_WAIT_SECONDS",
+    "JUNIT_REPORT_NAME",
     "RECOVERY_WAIT_SECONDS",
     "REDIS_CLUSTER_NODE_PORTS",
+    "TREND_SUMMARY_NAME",
+    "CaseResult",
     "ClusterNodeState",
     "DockerContainerController",
     "FailoverPlan",
     "IntegrationService",
     "ServiceStatus",
+    "SuiteReport",
+    "TrendReport",
+    "build_parser",
+    "build_trend",
     "check_service",
     "cluster_container_name",
     "cluster_node_index",
@@ -73,10 +100,14 @@ __all__ = [
     "detect_host_address",
     "find_by_node_id",
     "integration_enabled",
+    "main",
     "parse_cluster_nodes",
+    "parse_junit_report",
+    "parse_junit_xml",
     "parse_slots",
     "plan_failover",
     "probe_tcp",
+    "render_markdown",
     "resolve_service",
     "run_docker",
     "wait_for_service",

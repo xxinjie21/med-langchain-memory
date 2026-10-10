@@ -33,7 +33,7 @@ med-langchain-memory/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                  # pytest + coverage + lint（必过门禁）
-│       ├── integration.yml         # 真实中间件集成用例（手动 + 每周定时，可选）
+│       ├── integration.yml         # 真实中间件集成用例（手动 + 每日夜间定时，可选）
 │       └── release.yml             # tag 发布：版本守卫 + 构建 + 产物校验 + GitHub Release
 ├── protos/
 │   └── med_session.proto           # 统一序列化协议（跨语言规范源）
@@ -80,7 +80,7 @@ med-langchain-memory/
 │   │   │   ├── messages.py
 │   │   │   └── admin.py            # 归档/迁移管理
 │   │   └── schemas.py              # 请求/响应 DTO
-│   ├── testing/                    # 集成测试支撑（纯标准库探针与开关）
+│   ├── testing/                    # 集成测试支撑（纯标准库：探针/开关、集群拓扑、JUnit 趋势）
 │   └── release.py                  # 发布守卫（tag/版本一致性 + 产物校验，纯标准库）
 ├── tests/                          # 与 src 镜像的全量单测
 │   ├── conftest.py
@@ -166,10 +166,11 @@ med-langchain-memory/
 | D38 | 发布流水线 | `release.py`（纯标准库发布守卫：tag ↔ pyproject ↔ `__version__` 三方比对 + sdist/wheel 完整性与元数据版本校验 + CLI）+ `release.yml`（`v*` tag 触发：守卫 → 全量测试 → 构建 → 产物校验 → GitHub Release，PyPI 走 OIDC 可信发布且默认关闭）+ `tests/test_release.py`、`tests/test_ci/test_release_workflow.py` | `feat: daily iteration D38 - tag-driven release pipeline with version guard` |
 | D39 | Redis Cluster 真机用例 | `docker-compose.integration.yml` 增三主三从 6 节点 + 一次性初始化容器（固定子网 + `MED_MEMORY_IT_CLUSTER_IP` 广播地址）；`testing/services.py` 增 `redis-cluster` 服务、`cluster_startup_nodes`、`detect_host_address`；`tests/test_integration/test_redis_cluster_live.py`（复用行为基准套件 + slot 亲和 + **真机回归：集群弃用 `MULTI`**）；`RedisClusterMedHistory._pipeline()` 覆写为非事务 pipeline | `feat: daily iteration D39 - real redis cluster integration tests` |
 | D40 | 集群故障转移演练 | `testing/cluster.py`（纯标准库：`CLUSTER NODES` 解析 `parse_cluster_nodes`/`parse_slots`、确定性目标选择 `plan_failover`→`FailoverPlan`、端口↔容器名映射 `cluster_node_index`/`cluster_container_name`、可注入时钟的 `wait_until`、可注入执行器的 `DockerContainerController`/`run_docker`）；`tests/test_integration/test_redis_cluster_failover.py`（停主节点 → 从节点晋升 → 读写可用 → 原主恢复收敛）；编排 6 节点显式固定 `container_name` | `feat: daily iteration D40 - redis cluster failover drill` |
+| D41 | 夜间 CI 与趋势上报 | `testing/trend.py`（纯标准库：JUnit XML 解析 `parse_junit_xml`/`parse_junit_report`、汇总 `SuiteReport`、趋势 `TrendReport.new_failures`/`fixed`/`pass_rate_delta`、Markdown 渲染 `render_markdown`、CLI `main`）；`integration.yml` 改为每日夜间 cron + `--junit-xml` + 摘要写入 `$GITHUB_STEP_SUMMARY` + `actions/cache` 滚动基线 + artifact 上传；`tests/test_integration/test_trend.py`（离线）+ `tests/test_ci/test_integration_workflow.py`（工作流静态规范 + CLI 选项真实性交叉校验） | `feat: daily iteration D41 - nightly integration ci with trend reporting` |
 
-> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 集成测试纳入夜间 CI 并上报趋势；
-> ② 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`）；
-> ③ MySQL 8 的 `pymysql` 驱动纳入 dev extras，让 MySQL 真机用例在 CI 默认可跑。
+> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`）；
+> ② MySQL 8 的 `pymysql` 驱动纳入 dev extras，让 MySQL 真机用例在 CI 默认可跑（并纳入夜间 workflow）；
+> ③ 夜间趋势接入外部看板（如把摘要推送到 PR 评论 / 状态徽章）。
 
 ---
 

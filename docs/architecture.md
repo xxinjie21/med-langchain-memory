@@ -313,6 +313,36 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 
 ---
 
+### ADR-13 · 集成测试报告用「JUnit + 滚动缓存」做趋势对比，而不是只看单次红绿
+
+**决策**：夜间集成工作流每次运行都产出 JUnit 报告（`--junit-xml`），
+由 `testing/trend.py` 渲染 Markdown 摘要写进 Job Summary，
+并把报告经 `actions/cache` 滚动给下一次运行当基线：
+
+| 关注点 | 实现 | 为什么这样切 |
+|---|---|---|
+| 汇总口径 | `parse_junit_xml` 逐条读 `<testcase>` | `<testsuite>` 的 `tests=` / `failures=` 属性可能与明细不一致，只信明细 |
+| 结果归一化 | `CaseResult.outcome` + `failing` | 只区分 passed / failed / error / skipped，`skipped` 不算失败 |
+| 通过率 | `SuiteReport.pass_rate` | 分母排除 `skipped`（集成套件大量条件跳过，否则通过率被稀释） |
+| 趋势 | `TrendReport.new_failures` / `fixed` / `pass_rate_delta` | 按 `classname::name` 做集合差，回答「这次是不是我弄坏的」 |
+| 输出 | `render_markdown` | 直接追加进 `$GITHUB_STEP_SUMMARY`，无需第三方报告平台 |
+| 基线来源 | `actions/cache` + `restore-keys` 前缀 | 不引入外部存储，也不需要跨 run 读 artifact 的 API 调用 |
+
+**理由**：
+
+* 「这次红了」信息量很低——集成套件依赖外部容器，**偶发失败与真实回归必须区分开**，
+  只有和上一次运行对比才能回答「是不是新引入的问题」；
+* 摘要步骤与 `pytest` 步骤解耦：`pytest` 的退出码负责卡关，摘要步骤 `if: always()` 负责可读化，
+  因此**失败时也能拿到报告**（失败信息恰恰最需要被看到）；
+* CLI 只做「解析 → 渲染 → 落盘」，退出码不含「有失败用例」这一维，
+  避免摘要步骤自己变成第二个卡关点，掩盖 pytest 的真实状态；
+* 解析只用标准库 `xml.etree.ElementTree`，与项目「零文本预处理依赖」的边界一致。
+
+**代价**：GitHub 缓存条目按 `run_id` 累积（保留期受仓库缓存配额约束）；
+`reports/` 目录已加入 `.gitignore`，本地跑不会污染工作区。
+
+---
+
 ## 5. 并发与可用性
 
 | 机制 | 实现 | 降级路径 |
@@ -364,7 +394,8 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 | 真实后端集成 | `tests/test_integration/` + `integration` 标记：`MED_MEMORY_IT=1` 且服务可达才执行，否则跳过；同一份行为基准套件在真机上再跑一遍 |
 | 真机守护的缺陷 | 集群弃用 `MULTI`（ES 索引模板、MySQL 同毫秒保序同理）——替身测不出的服务端行为由真机套件兜底 |
 | 高可用演练 | `test_redis_cluster_failover.py` 停掉主节点容器验证从节点晋升 + 读写可用 + 自动收敛；编排逻辑在 `testing/cluster.py` 中纯函数化，离线可测 |
-| 集成环境编排 | `docker-compose.integration.yml`（Redis / MySQL / ES 带健康检查 + Redis Cluster 三主三从 6 节点 + 一次性初始化容器）；可选工作流 `.github/workflows/integration.yml` |
+| 集成环境编排 | `docker-compose.integration.yml`（Redis / MySQL / ES 带健康检查 + Redis Cluster 三主三从 6 节点 + 一次性初始化容器）；可选工作流 `.github/workflows/integration.yml`（手动 + 每日夜间） |
+| 夜间趋势上报 | `testing/trend.py` 解析 JUnit 报告渲染 Markdown 摘要写入 Job Summary，报告经 `actions/cache` 滚动为下次基线；离线单测在 `tests/test_integration/test_trend.py` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |

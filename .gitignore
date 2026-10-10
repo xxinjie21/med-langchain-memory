@@ -44,3 +44,6 @@ Thumbs.db
 .pytest_result.log
 .pytest_junit.xml
 .pytest-report.xml
+
+# JUnit reports / trend summaries produced by the nightly integration workflow
+reports/

@@ -3,13 +3,16 @@
 These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
 (regular expressions) and cross-check it against the project metadata:
 
-* the workflow must stay **opt-in** (``workflow_dispatch`` + weekly schedule)
+* the workflow must stay **opt-in** (``workflow_dispatch`` + nightly schedule)
   and must never be merged into the mandatory ``ci.yml`` gate;
 * it must select the integration suite explicitly (``-m integration``) and
   switch the harness on via ``MED_MEMORY_IT=1``;
 * the Redis Cluster must be started through ``docker-compose.integration.yml``
   (GitHub Actions ``services:`` cannot express a 6-node cluster), with the
   announce IP pinned to the compose subnet gateway and a teardown step;
+* every run must emit a JUnit report, render a Markdown trend summary into
+  ``$GITHUB_STEP_SUMMARY`` and roll the report forward through the cache so the
+  next nightly run can diff against it;
 * the ``integration`` marker must be registered in ``pyproject.toml``
   (``--strict-markers`` is enabled, so an unregistered marker fails the run);
 * every ``uses:`` reference must stay pinned to a major version tag.
@@ -24,6 +27,12 @@ from pathlib import Path
 import pytest
 
 from med_langchain_memory.testing import DEFAULT_SERVICES
+from med_langchain_memory.testing.trend import (
+    BASELINE_REPORT_NAME,
+    JUNIT_REPORT_NAME,
+    TREND_SUMMARY_NAME,
+    build_parser,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "integration.yml"
@@ -38,6 +47,14 @@ USES_PATTERN = re.compile(r"uses:\s*(\S+)")
 #: 允许的动作引用形态：``owner/repo@v<major>``。
 PINNED_ACTION_PATTERN = re.compile(r"[\w.-]+/[\w.-]+@v\d+$")
 
+#: 渲染趋势摘要的模块入口（与 ``testing/trend.py`` 的 CLI 对齐）。
+TREND_MODULE = "med_langchain_memory.testing.trend"
+
+#: ``python -m <module> ...`` 调用整段（含续行），用于交叉校验 CLI 选项。
+TREND_INVOCATION_PATTERN = re.compile(
+    rf"python -m {re.escape(TREND_MODULE)}(?P<args>(?:[^\n]*\\\n)*[^\n]*)"
+)
+
 
 def read_workflow() -> str:
     """Return the raw text of the integration workflow file.
@@ -49,6 +66,13 @@ def read_workflow() -> str:
     text = WORKFLOW_PATH.read_text(encoding="utf-8")
     assert text.strip(), "workflow file must not be empty"
     return text
+
+
+def trend_arguments() -> list[str]:
+    """Return the CLI tokens passed to the trend module inside the workflow."""
+    match = TREND_INVOCATION_PATTERN.search(read_workflow())
+    assert match is not None, f"{TREND_MODULE} is never invoked by the workflow"
+    return match.group("args").replace("\\", " ").split()
 
 
 class TestWorkflowFile:
@@ -66,13 +90,19 @@ class TestWorkflowFile:
 
 class TestTriggers:
     def test_is_opt_in_manual_and_scheduled(self) -> None:
-        """正向：仅手动触发 + 每周定时，不挂在 push / pull_request 上。"""
+        """正向：仅手动触发 + 定时，不挂在 push / pull_request 上。"""
         text = read_workflow()
         assert re.search(r"^on:", text, re.MULTILINE)
         assert "workflow_dispatch:" in text
-        assert re.search(r'schedule:\s*\n\s*-\s*cron:\s*"[^"]+"', text)
+        assert re.search(r'schedule:\s*\n(?:\s*#[^\n]*\n)*\s*-\s*cron:\s*"[^"]+"', text)
         assert "pull_request:" not in text
         assert re.search(r"^\s{2}push:", text, re.MULTILINE) is None
+
+    def test_runs_nightly_every_day(self) -> None:
+        """正向：定时任务必须是**每日夜间**跑一次（而不是每周）。"""
+        text = read_workflow()
+        crons = re.findall(r'cron:\s*"([^"]+)"', text)
+        assert crons == ["0 18 * * *"], f"expected a single nightly cron, got {crons}"
 
     def test_concurrency_cancels_in_progress_runs(self) -> None:
         """正向：并发组避免同一分支重复占资源。"""
@@ -86,7 +116,7 @@ class TestJob:
         """正向：显式选中 integration 用例并打开 ``MED_MEMORY_IT`` 开关。"""
         text = read_workflow()
         assert re.search(r"^\s{2}integration:", text, re.MULTILINE)
-        assert re.search(r"run:\s*pytest -m integration\s*$", text, re.MULTILINE)
+        assert re.search(r"run:\s*pytest -m integration\b", text)
         assert 'MED_MEMORY_IT: "1"' in text
 
     def test_job_declares_service_containers(self) -> None:
@@ -133,6 +163,62 @@ class TestRedisClusterJob:
         text = read_workflow()
         assert "down -v" in text
         assert re.search(r"if:\s*always\(\)", text)
+
+
+class TestTrendReporting:
+    """夜间运行必须产出可读摘要，并把报告滚动给下一次运行做对比。"""
+
+    def test_pytest_emits_junit_report(self) -> None:
+        """正向：pytest 步骤把结果写成 JUnit XML（摘要与缓存的输入）。"""
+        text = read_workflow()
+        assert f"--junit-xml=reports/{JUNIT_REPORT_NAME}" in text
+
+    def test_renders_summary_into_step_summary(self) -> None:
+        """正向：摘要渲染成 Markdown 并追加进 ``$GITHUB_STEP_SUMMARY``。"""
+        text = read_workflow()
+        assert f"--output reports/{TREND_SUMMARY_NAME}" in text
+        assert 'cat reports/integration-trend.md >> "$GITHUB_STEP_SUMMARY"' in text
+
+    def test_summary_step_runs_even_when_tests_fail(self) -> None:
+        """边界：用例失败时仍要出摘要（失败信息正是最需要被看到的）。"""
+        text = read_workflow()
+        step = re.search(
+            r"- name: Publish trend summary\n(?P<body>.*?)(?=\n\s*- name:|\Z)",
+            text,
+            re.DOTALL,
+        )
+        assert step is not None, "Publish trend summary step is missing"
+        assert re.search(r"if:\s*always\(\)", step.group("body"))
+
+    def test_rolls_report_forward_through_cache(self) -> None:
+        """正向：报告经缓存跨运行滚动，本次恢复出来的报告被改名为基线。"""
+        text = read_workflow()
+        assert "actions/cache@v4" in text
+        assert "integration-report-${{ github.run_id }}" in text
+        assert re.search(r"restore-keys:\s*\|", text)
+        assert f"mv reports/{JUNIT_REPORT_NAME} reports/{BASELINE_REPORT_NAME}" in text
+
+    def test_uploads_report_as_artifact(self) -> None:
+        """正向：报告目录作为 artifact 上传，便于事后排查。"""
+        text = read_workflow()
+        assert "actions/upload-artifact@v4" in text
+        assert "name: integration-report" in text
+        assert re.search(r"path:\s*reports/\s*$", text, re.MULTILINE)
+
+    def test_trend_cli_flags_exist_in_the_real_parser(self) -> None:
+        """边界：工作流传给 trend CLI 的每个长选项都必须真实存在。"""
+        known = {option for action in build_parser()._actions for option in action.option_strings}
+        flags = [token for token in trend_arguments() if token.startswith("--")]
+        assert flags, "workflow must pass options to the trend module"
+        unknown = [flag for flag in flags if flag not in known]
+        assert unknown == [], f"workflow references unknown trend options: {unknown}"
+
+    def test_trend_arguments_are_parseable(self) -> None:
+        """边界：工作流里那段命令行必须能被真实解析器解析通过。"""
+        parsed = build_parser().parse_args(trend_arguments())
+        assert parsed.report == Path("reports") / JUNIT_REPORT_NAME
+        assert parsed.baseline == Path("reports") / BASELINE_REPORT_NAME
+        assert parsed.output == Path("reports") / TREND_SUMMARY_NAME
 
 
 class TestActionPinning:

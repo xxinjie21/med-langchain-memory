@@ -261,10 +261,32 @@ docker compose -f docker-compose.integration.yml down -v
 | 地址覆盖 | `MED_MEMORY_IT_REDIS_URL` / `MED_MEMORY_IT_MYSQL_URL` / `MED_MEMORY_IT_ELASTICSEARCH_URL` / `MED_MEMORY_IT_REDIS_CLUSTER_URL` |
 | 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引、hash tag 同 slot、集群 pipeline 语义、集群故障转移） |
 | MySQL 前置 | 需宿主侧自备 DBAPI 驱动（如 `pip install pymysql`），缺失时 MySQL 用例跳过 |
-| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + 每周定时），不阻塞 `ci.yml` 必过门禁 |
+| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；每次运行都会产出趋势摘要并滚动缓存报告供下次对比（见下） |
 
 探针与开关逻辑在 `med_langchain_memory/testing/services.py`，只用标准库，
 因此「能不能跑」的判断本身不依赖任何中间件客户端。
+
+### 夜间 CI 与趋势上报
+
+`integration.yml` 每日 18:00 UTC（北京时间次日 02:00）跑一次，除了执行用例还做三件事：
+
+| 步骤 | 动作 |
+|---|---|
+| 报告 | `pytest -m integration --junit-xml=reports/integration.xml`，失败也照常出报告 |
+| 摘要 | `python -m med_langchain_memory.testing.trend reports/integration.xml --baseline reports/previous.xml` 渲染 Markdown 写进 Job Summary（用例数 / 通过率 / **新增失败** / **已修复** / 最慢用例） |
+| 滚动 | `reports/` 目录走 `actions/cache`，key 带 `run_id`、`restore-keys` 前缀命中上一次；恢复出的报告改名 `previous.xml` 作为本次基线 |
+
+趋势渲染逻辑在 `med_langchain_memory/testing/trend.py`，**纯标准库**
+（`xml.etree.ElementTree`），汇总口径一律从 `<testcase>` 子节点推导，
+不信任 `<testsuite>` 上的 `tests=` / `failures=` 属性。本地可直接复现：
+
+```bash
+MED_MEMORY_IT=1 pytest -m integration --junit-xml=reports/integration.xml
+python -m med_langchain_memory.testing.trend reports/integration.xml --output reports/trend.md
+```
+
+首次运行（没有基线）时基线列显示 `—`，不会报错。
+
 
 ### Redis Cluster（三主三从）
 
