@@ -7,7 +7,7 @@
 * :class:`TestMySQLLiveSharding` —— 替身无法证伪的服务端事实：
   ``crc32`` 分表落表位置、``ordinal`` 跨句柄同毫秒保序、``med_session`` 会话行 upsert。
 
-运行方式（需宿主侧自备 DBAPI 驱动，如 ``pip install pymysql``）::
+运行方式（``pymysql`` 驱动随 ``[mysql]`` / ``[dev]`` extras 安装）::
 
     docker compose -f docker-compose.integration.yml up -d mysql
     MED_MEMORY_IT=1 pytest -m integration tests/test_integration/test_mysql_live.py

@@ -39,8 +39,9 @@
 #
 # CI 侧的可选自动化见 .github/workflows/integration.yml。
 # Redis 单独使用 DB 15，避免与开发者本机其它数据混用。
-# MySQL 需要宿主侧自备 DBAPI 驱动（如 `pip install pymysql`），
-# 否则 MySQL 集成用例会以「驱动缺失」跳过——本编排文件本身不受影响。
+# MySQL 需要的 DBAPI 驱动（`pymysql`）已纳入 `[mysql]` 与 `[dev]` extras，
+# `pip install -e ".[dev]"` 即自带；缺失时 MySQL 集成用例会以「驱动缺失」跳过，
+# 本编排文件本身不受影响。
 name: med-memory-integration
 
 services:

@@ -144,7 +144,7 @@ def redis_cluster_live(redis_cluster_service: IntegrationService) -> Iterator[An
 def mysql_live(mysql_service: IntegrationService) -> Iterator[Any]:
     """真实 MySQL 引擎（自动建表，收尾释放连接池）。
 
-    需要宿主侧自备 DBAPI 驱动（如 ``pymysql``），缺失时本夹具跳过。
+    DBAPI 驱动（``pymysql``）随 ``[mysql]`` / ``[dev]`` extras 一起安装，缺失时本夹具跳过。
     """
     pytest.importorskip("sqlalchemy", reason="SQLAlchemy is an optional dependency")
     pytest.importorskip("pymysql", reason="a MySQL DBAPI driver (e.g. pymysql) is required")

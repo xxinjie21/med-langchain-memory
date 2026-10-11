@@ -7,6 +7,11 @@ These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
   and must never be merged into the mandatory ``ci.yml`` gate;
 * it must select the integration suite explicitly (``-m integration``) and
   switch the harness on via ``MED_MEMORY_IT=1``;
+* Redis, MySQL and Elasticsearch run as ``services:`` containers, and every service
+  address must be declared once at job level so the test step and the guard cannot drift;
+* the preflight guard (``med_langchain_memory.testing.preflight``) must run **before**
+  the suite and must declare every entry of ``DEFAULT_SERVICES`` as required, so a
+  broken environment fails the run instead of silently skipping every case;
 * the Redis Cluster must be started through ``docker-compose.integration.yml``
   (GitHub Actions ``services:`` cannot express a 6-node cluster), with the
   announce IP pinned to the compose subnet gateway and a teardown step;
@@ -26,7 +31,8 @@ from pathlib import Path
 
 import pytest
 
-from med_langchain_memory.testing import DEFAULT_SERVICES
+from med_langchain_memory.testing import DEFAULT_SERVICES, ENV_REQUIRED
+from med_langchain_memory.testing.preflight import build_parser as build_preflight_parser
 from med_langchain_memory.testing.trend import (
     BASELINE_REPORT_NAME,
     JUNIT_REPORT_NAME,
@@ -49,6 +55,9 @@ PINNED_ACTION_PATTERN = re.compile(r"[\w.-]+/[\w.-]+@v\d+$")
 
 #: 渲染趋势摘要的模块入口（与 ``testing/trend.py`` 的 CLI 对齐）。
 TREND_MODULE = "med_langchain_memory.testing.trend"
+
+#: 前置守卫的模块入口（与 ``testing/preflight.py`` 的 CLI 对齐）。
+PREFLIGHT_MODULE = "med_langchain_memory.testing.preflight"
 
 #: ``python -m <module> ...`` 调用整段（含续行），用于交叉校验 CLI 选项。
 TREND_INVOCATION_PATTERN = re.compile(
@@ -120,15 +129,63 @@ class TestJob:
         assert 'MED_MEMORY_IT: "1"' in text
 
     def test_job_declares_service_containers(self) -> None:
-        """正向：Redis 与 Elasticsearch 服务容器带健康检查启动。"""
+        """正向：Redis / MySQL / Elasticsearch 服务容器都带健康检查启动。"""
         text = read_workflow()
         assert re.search(r"^\s+redis:\s*$", text, re.MULTILINE)
+        assert re.search(r"^\s+mysql:\s*$", text, re.MULTILINE)
         assert re.search(r"^\s+elasticsearch:\s*$", text, re.MULTILINE)
-        assert text.count("--health-cmd") == 2
+        assert text.count("--health-cmd") == 3
+
+    def test_job_declares_shared_service_env(self) -> None:
+        """正向：服务地址在作业级 ``env`` 集中声明，用例步骤与守卫步骤共用同一份。"""
+        text = read_workflow()
+        job = re.search(
+            r"^  integration:\n(?P<body>.*?)(?=\n  \S|\Z)", text, re.MULTILINE | re.DOTALL
+        )
+        assert job is not None, "integration job is missing"
+        body = job.group("body")
+        assert re.search(r"^\s{4}env:\s*$", body, re.MULTILINE), "job-level env is missing"
+        for service in DEFAULT_SERVICES:
+            assert f"{service.env_var}: {service.url}" in body, (
+                f"{service.name} address is not declared at job level"
+            )
 
     def test_job_installs_dev_extras(self) -> None:
-        """正向：测试依赖走 ``.[dev]``，与 ci.yml 保持一致。"""
-        assert 'pip install -e ".[dev]"' in read_workflow()
+        """正向：测试依赖走 ``.[dev]``，与 ci.yml 保持一致（含 MySQL 驱动 pymysql）。"""
+        text = read_workflow()
+        assert 'pip install -e ".[dev]"' in text
+        assert "pymysql" in PYPROJECT_PATH.read_text(encoding="utf-8")
+
+
+class TestPreflightGuard:
+    """前置守卫：声明的服务必须真的可用，禁止「集体跳过」伪装成绿灯。"""
+
+    def test_workflow_declares_required_services(self) -> None:
+        """正向：必需服务清单覆盖 ``DEFAULT_SERVICES`` 的每一个服务。"""
+        text = read_workflow()
+        match = re.search(rf"{ENV_REQUIRED}:\s*(\S+)", text)
+        assert match is not None, f"{ENV_REQUIRED} is not declared by the workflow"
+        declared = match.group(1).split(",")
+        assert set(declared) == {service.name for service in DEFAULT_SERVICES}
+        assert len(declared) == len(set(declared)), "required list must not repeat a service"
+
+    def test_workflow_runs_the_guard_module(self) -> None:
+        """正向：守卫以模块路径执行（包根 ``main`` 属于 trend CLI，不可混用）。"""
+        assert f"python -m {PREFLIGHT_MODULE}" in read_workflow()
+
+    def test_guard_runs_before_the_test_suite(self) -> None:
+        """边界：守卫必须排在 pytest 之前，否则失败信息会被一堆 skip 淹没。"""
+        text = read_workflow()
+        guard = text.index(PREFLIGHT_MODULE)
+        pytest_step = text.index("pytest -m integration")
+        assert guard < pytest_step, "preflight guard must run before the integration suite"
+
+    def test_guard_uses_only_documented_cli_options(self) -> None:
+        """边界：工作流传给守卫的命令行必须能被真实解析器解析通过。"""
+        match = re.search(rf"python -m {PREFLIGHT_MODULE}(?P<args>[^\n]*)", read_workflow())
+        assert match is not None
+        parsed = build_preflight_parser().parse_args(match.group("args").split())
+        assert parsed.services == []
 
 
 class TestRedisClusterJob:
@@ -268,6 +325,12 @@ class TestDocumentation:
         readme = README_PATH.read_text(encoding="utf-8")
         assert "MED_MEMORY_IT_CLUSTER_IP" in readme
         assert "redis-cluster" in readme
+
+    def test_readme_documents_the_preflight_guard(self) -> None:
+        """正向：README 必须说明「必需服务不可用即失败」的守卫与其变量名。"""
+        readme = README_PATH.read_text(encoding="utf-8")
+        assert ENV_REQUIRED in readme
+        assert PREFLIGHT_MODULE in readme
 
     @pytest.mark.parametrize("path", [WORKFLOW_PATH, COMPOSE_PATH])
     def test_deliverables_reference_each_other(self, path: Path) -> None:

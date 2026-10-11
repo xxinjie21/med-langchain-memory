@@ -28,7 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 redis = ["redis>=5.0,<6"]
-mysql = ["SQLAlchemy>=2.0,<3"]
+mysql = ["SQLAlchemy>=2.0,<3", "pymysql>=1.1"]
 es = ["elasticsearch>=8.0,<9"]
 api = ["fastapi>=0.110,<1"]
 token = ["tiktoken>=0.7"]
@@ -40,6 +40,7 @@ dev = [
     "redis>=5.0,<6",
     "fakeredis>=2.23",
     "SQLAlchemy>=2.0,<3",
+    "pymysql>=1.1",
     "elasticsearch>=8.0,<9",
     "fastapi>=0.110,<1",
     "httpx>=0.27",

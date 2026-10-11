@@ -167,10 +167,11 @@ med-langchain-memory/
 | D39 | Redis Cluster 真机用例 | `docker-compose.integration.yml` 增三主三从 6 节点 + 一次性初始化容器（固定子网 + `MED_MEMORY_IT_CLUSTER_IP` 广播地址）；`testing/services.py` 增 `redis-cluster` 服务、`cluster_startup_nodes`、`detect_host_address`；`tests/test_integration/test_redis_cluster_live.py`（复用行为基准套件 + slot 亲和 + **真机回归：集群弃用 `MULTI`**）；`RedisClusterMedHistory._pipeline()` 覆写为非事务 pipeline | `feat: daily iteration D39 - real redis cluster integration tests` |
 | D40 | 集群故障转移演练 | `testing/cluster.py`（纯标准库：`CLUSTER NODES` 解析 `parse_cluster_nodes`/`parse_slots`、确定性目标选择 `plan_failover`→`FailoverPlan`、端口↔容器名映射 `cluster_node_index`/`cluster_container_name`、可注入时钟的 `wait_until`、可注入执行器的 `DockerContainerController`/`run_docker`）；`tests/test_integration/test_redis_cluster_failover.py`（停主节点 → 从节点晋升 → 读写可用 → 原主恢复收敛）；编排 6 节点显式固定 `container_name` | `feat: daily iteration D40 - redis cluster failover drill` |
 | D41 | 夜间 CI 与趋势上报 | `testing/trend.py`（纯标准库：JUnit XML 解析 `parse_junit_xml`/`parse_junit_report`、汇总 `SuiteReport`、趋势 `TrendReport.new_failures`/`fixed`/`pass_rate_delta`、Markdown 渲染 `render_markdown`、CLI `main`）；`integration.yml` 改为每日夜间 cron + `--junit-xml` + 摘要写入 `$GITHUB_STEP_SUMMARY` + `actions/cache` 滚动基线 + artifact 上传；`tests/test_integration/test_trend.py`（离线）+ `tests/test_ci/test_integration_workflow.py`（工作流静态规范 + CLI 选项真实性交叉校验） | `feat: daily iteration D41 - nightly integration ci with trend reporting` |
+| D42 | MySQL 真机用例入 CI + 前置守卫 | `testing/preflight.py`（纯标准库：必需服务清单 `parse_required`、结果汇总 `PreflightReport.ok`/`failures`/`render`、逐服务探针 `preflight`、CLI `main`）；`pymysql` 纳入 `[mysql]` / `[dev]` extras；`integration.yml` 增 MySQL `services:` 容器、四个服务地址上提到作业级 `env`、pytest 之前插入守卫步骤（`MED_MEMORY_IT_REQUIRED` 任一不可用即失败）；`tests/test_integration/test_preflight.py`（离线）+ `tests/test_ci/test_integration_workflow.py` 增守卫与共享 env 规范 | `feat: daily iteration D42 - mysql live ci with required-service preflight guard` |
 
 > 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`）；
-> ② MySQL 8 的 `pymysql` 驱动纳入 dev extras，让 MySQL 真机用例在 CI 默认可跑（并纳入夜间 workflow）；
-> ③ 夜间趋势接入外部看板（如把摘要推送到 PR 评论 / 状态徽章）。
+> ② 夜间趋势接入外部看板（如把摘要推送到 PR 评论 / 状态徽章）；
+> ③ 集成套件按服务分片并行（Redis / MySQL / ES / Cluster 四组独立作业，缩短夜间墙钟时间）。
 
 ---
 

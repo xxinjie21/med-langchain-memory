@@ -4,8 +4,9 @@
 仅被 ``tests/test_integration/`` 使用，且只依赖标准库。
 
 公开符号见 :mod:`med_langchain_memory.testing.services`（服务探测与开关）、
-:mod:`med_langchain_memory.testing.cluster`（集群拓扑解析与故障转移演练）与
-:mod:`med_langchain_memory.testing.trend`（JUnit 报告汇总与趋势对比）。
+:mod:`med_langchain_memory.testing.cluster`（集群拓扑解析与故障转移演练）、
+:mod:`med_langchain_memory.testing.trend`（JUnit 报告汇总与趋势对比）与
+:mod:`med_langchain_memory.testing.preflight`（CI 前置守卫：必需服务不可用即失败）。
 """
 
 from __future__ import annotations
@@ -27,6 +28,16 @@ from .cluster import (
     plan_failover,
     run_docker,
     wait_until,
+)
+
+# 注意：preflight 的 CLI 入口（build_parser / main）**不**在此导出——
+# 包根上的这两个名字已经属于 trend 的 CLI，导出会造成静默覆盖。
+# 守卫的入口按模块路径调用：``python -m med_langchain_memory.testing.preflight``。
+from .preflight import (
+    ENV_REQUIRED,
+    PreflightReport,
+    parse_required,
+    preflight,
 )
 from .services import (
     CLUSTER_ANNOUNCE_ENV,
@@ -78,6 +89,7 @@ __all__ = [
     "DEFAULT_WAIT_INTERVAL_SECONDS",
     "DEFAULT_WAIT_SECONDS",
     "ENV_PREFIX",
+    "ENV_REQUIRED",
     "FAILOVER_WAIT_SECONDS",
     "JUNIT_REPORT_NAME",
     "RECOVERY_WAIT_SECONDS",
@@ -88,6 +100,7 @@ __all__ = [
     "DockerContainerController",
     "FailoverPlan",
     "IntegrationService",
+    "PreflightReport",
     "ServiceStatus",
     "SuiteReport",
     "TrendReport",
@@ -104,8 +117,10 @@ __all__ = [
     "parse_cluster_nodes",
     "parse_junit_report",
     "parse_junit_xml",
+    "parse_required",
     "parse_slots",
     "plan_failover",
+    "preflight",
     "probe_tcp",
     "render_markdown",
     "resolve_service",
