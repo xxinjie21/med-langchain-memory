@@ -71,7 +71,8 @@ LLM 本身无状态，对话的「记忆」必须由外部存储承担。本库�
 │  ├─ services.py  集成测试服务探针 + 显式开关 + 集群启动节点/广播地址解析  │
 │  ├─ cluster.py   集群拓扑解析 + 故障转移目标选择 + docker 容器控制 + 轮询  │
 │  ├─ trend.py     JUnit 报告汇总 + 趋势对比 + Markdown 渲染             │
-│  └─ preflight.py 必需服务前置守卫：不可达即失败（防「集体跳过」假绿灯）│
+│  ├─ preflight.py 必需服务前置守卫：不可达即失败（防「集体跳过」假绿灯）│
+│  └─ shards.py    集成套件按服务分片：用例路径/服务/compose 名/环境变量的单一真值源│
 ├──────────────────────────────────────────────────────────────────────┤
 │  serde/          序列化层：Serializer 抽象 + ProtobufSerializer          │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -350,14 +351,16 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 **决策**：`integration.yml` 在执行用例**之前**先跑
 `python -m med_langchain_memory.testing.preflight`，由 `MED_MEMORY_IT_REQUIRED`
 声明「必须可用」的服务清单；任一服务不可用即整步失败。
-四个服务地址在**作业级 `env` 声明一次**，用例步骤与守卫步骤共用：
+地址不再手写在工作流里：每个分片的清单与地址由
+`med_langchain_memory.testing.shards --format env` 生成（见 ADR-15），
+用例步骤与守卫步骤读同一份 `$GITHUB_ENV`：
 
 | 关注点 | 实现 | 为什么这样切 |
 |---|---|---|
 | 必需清单 | `parse_required`（逗号分隔、去空白、去重保序） | 未声明时返回空元组 → 守卫对本地手工 `pytest` 无副作用 |
 | 判定 | `PreflightReport.ok` = 无解析错误 且 全部服务 `ready` | 复用 `ServiceStatus.ready`，与用例夹具同一套判定口径 |
 | 服务名拼错 | 记进 `errors` 而非抛异常 | 守卫的价值在于把问题**一次列全**，而不是首个错误就退出 |
-| 地址来源 | 作业级 `env` + `DEFAULT_SERVICES` 默认值 | 用例与守卫读同一份地址，杜绝「步骤里改了端口、守卫还在探旧端口」 |
+| 地址来源 | 分片模块生成后写进 `$GITHUB_ENV`（缺省值来自 `DEFAULT_SERVICES`） | 用例与守卫读同一份地址，杜绝「步骤里改了端口、守卫还在探旧端口」 |
 | 入口 | `python -m med_langchain_memory.testing.preflight`（模块路径） | 包根上的 `main` / `build_parser` 已属于 `trend` 的 CLI，导出会静默覆盖 |
 
 **理由**：
@@ -370,8 +373,46 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 * 协议级就绪（集群是否 `cluster_state:ok`、ES 是否加载模板）仍由用例自己的夹具轮询，
   职责边界清晰：守卫管「端口通不通」，夹具管「服务能不能用」。
 
-**代价**：多一个步骤、多一个环境变量；守卫与 `services:` 健康检查有部分重叠
+**代价**：多一个步骤、多一个环境变量；守卫与容器健康检查有部分重叠
 （健康检查保证容器已起，守卫额外覆盖「compose 起的 Redis Cluster 与地址覆盖是否生效」）。
+
+---
+
+### ADR-15 · 集成套件按服务分片并行，分片表是「单一真值来源」
+
+**决策**：把真机套件按服务切成四个**互不依赖**的分片
+（`redis` / `mysql` / `elasticsearch` / `redis-cluster`），
+`integration.yml` 用 `strategy.matrix.shard` 并行执行；每个分片在自己的 runner 上
+**只拉起自己需要的容器**。分片表（用例路径 / 必需服务 / compose 服务名 /
+初始化容器 / 环境变量）全部由纯标准库模块
+`med_langchain_memory.testing.shards` 给出，工作流只调用它的 CLI：
+
+| 关注点 | 实现 | 为什么这样切 |
+|---|---|---|
+| 分片定义 | `SHARDS`（冻结 dataclass 元组）+ `resolve_shard` / `select_shards` | 新增分片只改一处；矩阵取值由 `shard_names()` 交叉校验 |
+| 用例路径 | `--format paths` | 工作流不写路径，避免「分片表加了用例、工作流没跟上」 |
+| 必需服务 | `--format required` → `$GITHUB_ENV` | 与 ADR-14 的守卫共用，分片化后守卫粒度也更准 |
+| 拉起容器 | `--format compose` → `docker compose up -d --wait <服务>` | 只起本分片需要的服务，冷启动时间不叠加 |
+| 一次性初始化 | `--format init` → `run --rm <容器>` | 集群分片才需要；非集群分片拿到空串即整步跳过，工作流无需 `if:` 判断分片名 |
+| 服务地址 | `--format env`（复用 `services.resolve_service`） | 工作流里**不出现任何 `MED_MEMORY_IT_*_URL` 字面量** |
+| 失败语义 | `fail-fast: false` | 一个分片红不代表其它分片没有价值，四个分片各自出结论 |
+
+**理由**：
+
+* 单作业串行跑全部真机套件时，墙钟时间 = 四个服务的启动时间与用例耗时之和
+  （ES 冷启动最慢，6 节点集群还要额外组集群）；分片并行后墙钟时间由
+  「最慢的那个分片」决定，且任一服务的启动抖动只影响自己那一片；
+* 中间件统一改走 `docker compose`：GitHub Actions 的 `services:` **无法按矩阵分片**
+  （声明了就会让每个分片都拉起全部容器），而 Redis Cluster 本来就只能用 compose。
+  compose 里每个长驻服务都有 `healthcheck`，`up -d --wait` 与原先 `services:`
+  的健康检查语义等价；
+* 「配置即数据」而非「配置即 YAML」：分片表是普通 Python 数据，
+  因此矩阵取值、compose 服务名、服务地址都能被 pytest 直接断言，
+  工作流静态测试可以做成**交叉校验**（工作流传的 CLI 选项必须能被真实解析器解析、
+  分片要的 compose 服务名必须在编排文件里存在）。
+
+**代价**：每个分片重复一遍 checkout / setup-python / pip install（矩阵作业的固有开销）；
+报告、缓存与 artifact 都按分片隔离，Job Summary 从一份变成四份。
 
 ---
 
@@ -427,8 +468,9 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 | 真机守护的缺陷 | 集群弃用 `MULTI`（ES 索引模板、MySQL 同毫秒保序同理）——替身测不出的服务端行为由真机套件兜底 |
 | 高可用演练 | `test_redis_cluster_failover.py` 停掉主节点容器验证从节点晋升 + 读写可用 + 自动收敛；编排逻辑在 `testing/cluster.py` 中纯函数化，离线可测 |
 | 集成环境编排 | `docker-compose.integration.yml`（Redis / MySQL / ES 带健康检查 + Redis Cluster 三主三从 6 节点 + 一次性初始化容器）；可选工作流 `.github/workflows/integration.yml`（手动 + 每日夜间），跑用例前先过前置守卫 |
+| 分片并行 | `testing/shards.py` 把真机套件按服务切成四个矩阵分片（`redis` / `mysql` / `elasticsearch` / `redis-cluster`），每个分片只拉起自己的容器；分片表是单一真值来源，工作流不硬编码任何服务地址 / 分片名 / 容器名；离线单测在 `tests/test_integration/test_shards.py` |
 | 假绿灯防护 | `testing/preflight.py` 按 `MED_MEMORY_IT_REQUIRED` 逐个探针，任一必需服务不可用即退出码 1——否则「用例集体 skip」会让环境故障伪装成通过；离线单测在 `tests/test_integration/test_preflight.py` |
-| 夜间趋势上报 | `testing/trend.py` 解析 JUnit 报告渲染 Markdown 摘要写入 Job Summary，报告经 `actions/cache` 滚动为下次基线；离线单测在 `tests/test_integration/test_trend.py` |
+| 夜间趋势上报 | `testing/trend.py` 解析 JUnit 报告渲染 Markdown 摘要写入 Job Summary，报告经 `actions/cache` **按分片**滚动为下次基线；离线单测在 `tests/test_integration/test_trend.py` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |

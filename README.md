@@ -115,7 +115,7 @@ src/med_langchain_memory/
 ├── privacy/       # 字段级正则脱敏（手机号 / 身份证 / 病历号 / 床号）
 ├── runnable/      # 医疗增强 Runnable：租户隔离、Token 裁剪、LLM 摘要、并发锁、降级熔断
 ├── api/           # FastAPI 会话管理接口
-├── testing/       # 集成测试支撑：探针/开关、CI 前置守卫、集群演练与 JUnit 趋势（纯标准库）
+├── testing/       # 集成测试支撑：探针/开关、CI 前置守卫、分片计划、集群演练与 JUnit 趋势（纯标准库）
 ├── config.py      # 全局配置（pydantic-settings）
 └── exceptions.py  # 统一异常体系
 ```
@@ -261,7 +261,7 @@ docker compose -f docker-compose.integration.yml down -v
 | 地址覆盖 | `MED_MEMORY_IT_REDIS_URL` / `MED_MEMORY_IT_MYSQL_URL` / `MED_MEMORY_IT_ELASTICSEARCH_URL` / `MED_MEMORY_IT_REDIS_CLUSTER_URL` |
 | 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引、hash tag 同 slot、集群 pipeline 语义、集群故障转移） |
 | MySQL 前置 | DBAPI 驱动 `pymysql` 随 `[mysql]` / `[dev]` extras 一起装，缺失时 MySQL 用例跳过 |
-| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；跑之前先过前置守卫，每次运行都会产出趋势摘要并滚动缓存报告供下次对比（见下） |
+| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；按服务**分片并行**，跑之前先过分片前置守卫，每个分片各自产出趋势摘要并滚动缓存报告供下次对比（见下） |
 
 探针与开关逻辑在 `med_langchain_memory/testing/services.py`，只用标准库，
 因此「能不能跑」的判断本身不依赖任何中间件客户端。
@@ -287,25 +287,69 @@ MED_MEMORY_IT=1 pytest -m integration
 | 退出码 | 全部就绪（或未声明）为 `0`；存在未就绪 / 拼错的服务为 `1` |
 | 边界 | 只判 TCP 可达，不握手；「集群是否已收敛」由用例自己的夹具（`CLUSTER INFO`）兜底 |
 
+### 分片并行与分片解析
+
+真机套件按服务切成四个**互不依赖**的分片，每个分片在自己的 CI runner 上只拉起
+自己需要的容器，墙钟时间由「最慢的那个分片」决定，而不是「四个服务串行之和」：
+
+| 分片 | 用例 | 需要的服务 | 额外步骤 |
+|---|---|---|---|
+| `redis` | `test_redis_live.py` | `redis` | — |
+| `mysql` | `test_mysql_live.py` | `mysql` | — |
+| `elasticsearch` | `test_es_live.py` | `elasticsearch` | — |
+| `redis-cluster` | `test_redis_cluster_live.py` + `test_redis_cluster_failover.py` | `redis-cluster` | 6 节点 + `redis-cluster-init` 一次性组集群 |
+
+分片表（用例路径 / 必需服务 / compose 服务名 / 初始化容器 / 环境变量）是
+**单一真值来源**，由 `med_langchain_memory/testing/shards.py` 生成（纯标准库），
+工作流里不出现任何服务地址字面量，也不硬编码分片名与容器名——新增分片只需改那个模块：
+
+```bash
+python -m med_langchain_memory.testing.shards                                   # 列出全部分片
+python -m med_langchain_memory.testing.shards --shard mysql --format required   # redis,mysql… 里本分片那几项
+python -m med_langchain_memory.testing.shards --shard redis --format paths      # 可直接拼在 pytest 后面
+python -m med_langchain_memory.testing.shards --shard redis-cluster --format compose
+python -m med_langchain_memory.testing.shards --shard redis-cluster --format init
+python -m med_langchain_memory.testing.shards --shard redis --format env        # KEY=VALUE，可 >> $GITHUB_ENV
+```
+
+| 项 | 说明 |
+|---|---|
+| `--shard` | 可重复；省略或传 `all` 表示全部分片；分片名拼错时退出码 `2` 并把合法取值写进 stderr |
+| `--format` | `table`（默认）/ `paths` / `required` / `compose` / `init` / `env` |
+| 环境透传 | `--format env` 会读本机环境变量：本地覆盖了某个服务地址时原样透传，本地与 CI 行为一致 |
+
+本地按分片跑单个后端（只起该分片的容器）：
+
+```bash
+docker compose -f docker-compose.integration.yml up -d --wait mysql
+MED_MEMORY_IT=1 MED_MEMORY_IT_REQUIRED=mysql pytest -m integration \
+  $(python -m med_langchain_memory.testing.shards --shard mysql --format paths)
+docker compose -f docker-compose.integration.yml down -v
+```
+
 ### 夜间 CI 与趋势上报
 
-`integration.yml` 每日 18:00 UTC（北京时间次日 02:00）跑一次，除了执行用例还做四件事：
+`integration.yml` 每日 18:00 UTC（北京时间次日 02:00）跑一次，四个分片并行，
+每个分片除了执行用例还做四件事：
 
 | 步骤 | 动作 |
 |---|---|
-| 服务 | Redis / MySQL / Elasticsearch 三个 `services:` 容器（均带健康检查）+ compose 起的三主三从 Redis Cluster；四个地址在作业级 `env` 集中声明，用例步骤与守卫步骤共用 |
-| 守卫 | `python -m med_langchain_memory.testing.preflight` 先跑：`MED_MEMORY_IT_REQUIRED` 里的服务任一不可用即整步失败（见上） |
-| 报告 | `pytest -m integration --junit-xml=reports/integration.xml`，失败也照常出报告 |
-| 摘要 | `python -m med_langchain_memory.testing.trend reports/integration.xml --baseline reports/previous.xml` 渲染 Markdown 写进 Job Summary（用例数 / 通过率 / **新增失败** / **已修复** / 最慢用例） |
-| 滚动 | `reports/` 目录走 `actions/cache`，key 带 `run_id`、`restore-keys` 前缀命中上一次；恢复出的报告改名 `previous.xml` 作为本次基线 |
+| 服务 | `docker compose -f docker-compose.integration.yml up -d --wait <本分片服务>`：中间件统一走 compose（`services:` 无法按矩阵分片），`--wait` 等健康检查通过；集群分片再多一步 `run --rm redis-cluster-init` |
+| 环境 | `python -m med_langchain_memory.testing.shards --shard <分片> --format env >> "$GITHUB_ENV"`：总开关、本分片必需服务清单与地址全部由模块给出 |
+| 守卫 | `python -m med_langchain_memory.testing.preflight` 在用例之前跑：本分片的必需服务任一不可用即整步失败（见上） |
+| 报告 | `pytest -m integration --junit-xml=reports/<分片>/integration.xml`，失败也照常出报告 |
+| 摘要 | `python -m med_langchain_memory.testing.trend reports/<分片>/integration.xml --baseline reports/<分片>/previous.xml` 渲染 Markdown 写进 Job Summary（用例数 / 通过率 / **新增失败** / **已修复** / 最慢用例） |
+| 滚动 | `reports/<分片>/` 走 `actions/cache`，key 带分片名与 `run_id`、`restore-keys` 前缀命中**同一分片**的上一次；恢复出的报告改名 `previous.xml` 作为本次基线 |
+
+`fail-fast: false`：一个分片红不代表其它分片没有价值，四个分片各自出结论。
 
 趋势渲染逻辑在 `med_langchain_memory/testing/trend.py`，**纯标准库**
 （`xml.etree.ElementTree`），汇总口径一律从 `<testcase>` 子节点推导，
 不信任 `<testsuite>` 上的 `tests=` / `failures=` 属性。本地可直接复现：
 
 ```bash
-MED_MEMORY_IT=1 pytest -m integration --junit-xml=reports/integration.xml
-python -m med_langchain_memory.testing.trend reports/integration.xml --output reports/trend.md
+MED_MEMORY_IT=1 pytest -m integration --junit-xml=reports/redis/integration.xml
+python -m med_langchain_memory.testing.trend reports/redis/integration.xml --output reports/redis/trend.md
 ```
 
 首次运行（没有基线）时基线列显示 `—`，不会报错。
@@ -394,7 +438,7 @@ python -m med_langchain_memory.release --dist dist --expected-version v0.1.0   #
 
 ## 每日迭代节奏
 
-项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫）。
+项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行）。
 
 ---
 

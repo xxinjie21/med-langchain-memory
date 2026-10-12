@@ -5,8 +5,9 @@
 
 公开符号见 :mod:`med_langchain_memory.testing.services`（服务探测与开关）、
 :mod:`med_langchain_memory.testing.cluster`（集群拓扑解析与故障转移演练）、
-:mod:`med_langchain_memory.testing.trend`（JUnit 报告汇总与趋势对比）与
-:mod:`med_langchain_memory.testing.preflight`（CI 前置守卫：必需服务不可用即失败）。
+:mod:`med_langchain_memory.testing.trend`（JUnit 报告汇总与趋势对比）、
+:mod:`med_langchain_memory.testing.preflight`（CI 前置守卫：必需服务不可用即失败）与
+:mod:`med_langchain_memory.testing.shards`（集成套件按服务分片：并行作业的单一真值来源）。
 """
 
 from __future__ import annotations
@@ -58,6 +59,28 @@ from .services import (
     resolve_service,
     wait_for_service,
 )
+
+# 注意：shards 的 CLI 入口（build_parser / main）同样**不**在此导出——
+# 包根这两个名字属于 trend 的 CLI。分片入口按模块路径调用：
+# ``python -m med_langchain_memory.testing.shards``。
+from .shards import (
+    ALL_SHARDS,
+    CLUSTER_INITIALIZER,
+    FORMATS,
+    INTEGRATION_TEST_DIR,
+    SHARDS,
+    Shard,
+    render_compose,
+    render_env,
+    render_init,
+    render_paths,
+    render_required,
+    render_table,
+    required_services,
+    resolve_shard,
+    select_shards,
+    shard_names,
+)
 from .trend import (
     BASELINE_REPORT_NAME,
     DEFAULT_REPORTS_DIR,
@@ -76,8 +99,10 @@ from .trend import (
 )
 
 __all__ = [
+    "ALL_SHARDS",
     "BASELINE_REPORT_NAME",
     "CLUSTER_ANNOUNCE_ENV",
+    "CLUSTER_INITIALIZER",
     "COMPOSE_HINT",
     "COMPOSE_PROJECT_NAME",
     "DEFAULT_DOCKER_TIMEOUT_SECONDS",
@@ -91,9 +116,12 @@ __all__ = [
     "ENV_PREFIX",
     "ENV_REQUIRED",
     "FAILOVER_WAIT_SECONDS",
+    "FORMATS",
+    "INTEGRATION_TEST_DIR",
     "JUNIT_REPORT_NAME",
     "RECOVERY_WAIT_SECONDS",
     "REDIS_CLUSTER_NODE_PORTS",
+    "SHARDS",
     "TREND_SUMMARY_NAME",
     "CaseResult",
     "ClusterNodeState",
@@ -102,6 +130,7 @@ __all__ = [
     "IntegrationService",
     "PreflightReport",
     "ServiceStatus",
+    "Shard",
     "SuiteReport",
     "TrendReport",
     "build_parser",
@@ -122,9 +151,19 @@ __all__ = [
     "plan_failover",
     "preflight",
     "probe_tcp",
+    "render_compose",
+    "render_env",
+    "render_init",
     "render_markdown",
+    "render_paths",
+    "render_required",
+    "render_table",
+    "required_services",
     "resolve_service",
+    "resolve_shard",
     "run_docker",
+    "select_shards",
+    "shard_names",
     "wait_for_service",
     "wait_until",
 ]

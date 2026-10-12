@@ -3,13 +3,17 @@ name: Integration
 # 真实中间件集成测试：**可选**，不阻塞日常 CI（ci.yml 仍为唯一必过门禁）。
 # 触发方式：手动 workflow_dispatch，或每日 18:00 UTC（北京时间次日 02:00）夜间定时跑一次。
 #
-# 覆盖范围：Redis / MySQL / Elasticsearch 三个服务容器，以及用 docker compose 起的
-# 三主三从 Redis Cluster（GitHub Actions 的 `services:` 只支持单容器，6 节点集群只能走 compose）。
-# 四个服务全部通过 `MED_MEMORY_IT_REQUIRED` 声明为**必需**：跑之前先执行前置守卫
-# （`testing/preflight.py`），任一服务不可用即整步失败——否则用例集体 skip 会伪装成绿灯。
+# 分片并行：四个真机套件按服务切成四个矩阵分片（redis / mysql / elasticsearch /
+# redis-cluster），每个分片在自己的 runner 上**只拉起自己需要的容器**，
+# 于是墙钟时间由「最慢的那个分片」决定，而不是「四个服务串行之和」。
 #
-# 每次运行都会把 pytest 的 JUnit 报告缓存下来，供下一次运行做趋势对比，
-# 并把 Markdown 摘要写进 Job Summary（渲染逻辑见 med_langchain_memory/testing/trend.py）。
+# 分片表（用例路径 / 必需服务 / compose 服务名 / 初始化容器 / 环境变量）由
+# `med_langchain_memory.testing.shards` 生成，工作流里**不出现任何服务地址字面量**，
+# 也不硬编码分片名与容器名——新增分片只需改那个模块。
+#
+# 中间件统一走 docker compose：`services:` 无法按矩阵分片（会让每个分片都拉起全部容器），
+# 而 Redis Cluster 本来就只能用 compose。compose 里每个长驻服务都有 healthcheck，
+# `up -d --wait` 会等到健康后再进入守卫与用例步骤。
 on:
   workflow_dispatch:
   schedule:
@@ -22,51 +26,17 @@ concurrency:
 
 jobs:
   integration:
-    name: Integration (real middleware)
+    name: Integration (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # 服务地址集中声明一次：用例步骤与前置守卫步骤共用，避免两处漂移。
+    # fail-fast: false —— 一个分片红不代表其它分片没有价值，四个分片各自出结论。
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [redis, mysql, elasticsearch, redis-cluster]
     env:
-      MED_MEMORY_IT: "1"
-      MED_MEMORY_IT_REQUIRED: redis,mysql,elasticsearch,redis-cluster
-      MED_MEMORY_IT_REDIS_URL: redis://localhost:16379/15
-      MED_MEMORY_IT_MYSQL_URL: mysql+pymysql://root:med@localhost:13306/med_memory
-      MED_MEMORY_IT_ELASTICSEARCH_URL: http://localhost:19200
-      MED_MEMORY_IT_REDIS_CLUSTER_URL: redis://localhost:17001/0
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 16379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 12
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_ROOT_PASSWORD: med
-          MYSQL_DATABASE: med_memory
-        ports:
-          - 13306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -pmed"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 24
-      elasticsearch:
-        image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
-        env:
-          discovery.type: single-node
-          xpack.security.enabled: "false"
-          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
-        ports:
-          - 19200:9200
-        options: >-
-          --health-cmd "curl -fs http://localhost:9200/_cluster/health"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 24
+      # 集群节点广播地址：Linux runner 上编排固定子网的网关双向可达，无需像
+      # Docker Desktop 那样覆盖成宿主机局域网 IP。
+      MED_MEMORY_IT_CLUSTER_IP: 172.31.240.1
     steps:
       - uses: actions/checkout@v4
 
@@ -79,66 +49,75 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
-      # 滚动缓存：key 带 run_id 保证每次都写新条目，restore-keys 前缀命中最近一次。
-      # 缓存内容就是 reports/ 目录，含上一次的 integration.xml 与 integration-trend.md。
+      # 分片环境由 shards 模块生成：总开关 + 本分片的必需服务清单 + 本分片服务地址。
+      - name: Resolve shard environment
+        run: python -m med_langchain_memory.testing.shards --shard "${{ matrix.shard }}" --format env >> "$GITHUB_ENV"
+
+      # 滚动缓存：key 带 run_id 保证每次都写新条目，restore-keys 前缀命中同一分片的上一次。
+      # 缓存内容是该分片自己的 reports/<shard>/ 目录。
       - name: Restore previous JUnit report
         uses: actions/cache@v4
         with:
-          path: reports
-          key: integration-report-${{ github.run_id }}
+          path: reports/${{ matrix.shard }}
+          key: integration-report-${{ matrix.shard }}-${{ github.run_id }}
           restore-keys: |
-            integration-report-
+            integration-report-${{ matrix.shard }}-
 
       - name: Keep restored report as baseline
         run: |
-          mkdir -p reports
-          if [ -f reports/integration.xml ]; then mv reports/integration.xml reports/previous.xml; fi
+          mkdir -p "reports/${{ matrix.shard }}"
+          if [ -f "reports/${{ matrix.shard }}/integration.xml" ]; then
+            mv "reports/${{ matrix.shard }}/integration.xml" \
+               "reports/${{ matrix.shard }}/previous.xml"
+          fi
 
-      # 集群节点广播地址取编排固定子网的网关（172.31.240.1）：
-      # Linux runner 上容器与宿主机双向可达，因此无需像 Docker Desktop 那样覆盖。
-      - name: Start redis cluster
-        env:
-          MED_MEMORY_IT_CLUSTER_IP: 172.31.240.1
+      # 只拉起本分片需要的容器，并等健康检查通过。
+      - name: Start shard services
         run: |
-          docker compose -f docker-compose.integration.yml up -d \
-            redis-cluster-1 redis-cluster-2 redis-cluster-3 \
-            redis-cluster-4 redis-cluster-5 redis-cluster-6
-          docker compose -f docker-compose.integration.yml run --rm redis-cluster-init
+          docker compose -f docker-compose.integration.yml up -d --wait \
+            $(python -m med_langchain_memory.testing.shards --shard "${{ matrix.shard }}" --format compose)
 
-      # 前置守卫：`MED_MEMORY_IT_REQUIRED` 里的服务必须真的可连，
-      # 否则用例会集体 skip 而整轮依旧「绿」，把环境故障伪装成通过。
+      # 集群分片多一步一次性组集群；非集群分片这里拿到空串，整步无事发生。
+      - name: Run shard initializer
+        run: |
+          initializer=$(python -m med_langchain_memory.testing.shards --shard "${{ matrix.shard }}" --format init)
+          if [ -n "$initializer" ]; then
+            docker compose -f docker-compose.integration.yml run --rm "$initializer"
+          fi
+
+      # 前置守卫：本分片声明的服务必须真的可连，否则用例会集体 skip 而整轮依旧「绿」，
+      # 把环境故障伪装成通过。
       - name: Preflight required services
         run: python -m med_langchain_memory.testing.preflight
 
       - name: Run integration tests
-        run: pytest -m integration --junit-xml=reports/integration.xml
+        run: |
+          pytest -m integration \
+            --junit-xml="reports/${{ matrix.shard }}/integration.xml" \
+            $(python -m med_langchain_memory.testing.shards --shard "${{ matrix.shard }}" --format paths)
 
       # 无论用例成败都出摘要：pytest 已把失败写进 JUnit，这一步只负责可读化。
       - name: Publish trend summary
         if: always()
         run: |
           python -m med_langchain_memory.testing.trend \
-            reports/integration.xml \
-            --baseline reports/previous.xml \
-            --output reports/integration-trend.md
-          cat reports/integration-trend.md >> "$GITHUB_STEP_SUMMARY"
+            "reports/${{ matrix.shard }}/integration.xml" \
+            --baseline "reports/${{ matrix.shard }}/previous.xml" \
+            --output "reports/${{ matrix.shard }}/integration-trend.md"
+          cat "reports/${{ matrix.shard }}/integration-trend.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload integration report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: integration-report
-          path: reports/
+          name: integration-report-${{ matrix.shard }}
+          path: reports/${{ matrix.shard }}/
           retention-days: 30
 
-      - name: Dump redis cluster logs
+      - name: Dump service logs
         if: failure()
-        env:
-          MED_MEMORY_IT_CLUSTER_IP: 172.31.240.1
         run: docker compose -f docker-compose.integration.yml logs --tail 80
 
-      - name: Tear down redis cluster
+      - name: Tear down services
         if: always()
-        env:
-          MED_MEMORY_IT_CLUSTER_IP: 172.31.240.1
         run: docker compose -f docker-compose.integration.yml down -v
