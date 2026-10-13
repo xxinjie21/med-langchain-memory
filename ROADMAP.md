@@ -80,7 +80,7 @@ med-langchain-memory/
 │   │   │   ├── messages.py
 │   │   │   └── admin.py            # 归档/迁移管理
 │   │   └── schemas.py              # 请求/响应 DTO
-│   ├── testing/                    # 集成测试支撑（纯标准库：探针/开关、集群拓扑、JUnit 趋势、分片计划）
+│   ├── testing/                    # 集成测试支撑（纯标准库：探针/开关、集群拓扑、JUnit 趋势、分片计划、分片聚合）
 │   └── release.py                  # 发布守卫（tag/版本一致性 + 产物校验，纯标准库）
 ├── tests/                          # 与 src 镜像的全量单测
 │   ├── conftest.py
@@ -169,11 +169,12 @@ med-langchain-memory/
 | D41 | 夜间 CI 与趋势上报 | `testing/trend.py`（纯标准库：JUnit XML 解析 `parse_junit_xml`/`parse_junit_report`、汇总 `SuiteReport`、趋势 `TrendReport.new_failures`/`fixed`/`pass_rate_delta`、Markdown 渲染 `render_markdown`、CLI `main`）；`integration.yml` 改为每日夜间 cron + `--junit-xml` + 摘要写入 `$GITHUB_STEP_SUMMARY` + `actions/cache` 滚动基线 + artifact 上传；`tests/test_integration/test_trend.py`（离线）+ `tests/test_ci/test_integration_workflow.py`（工作流静态规范 + CLI 选项真实性交叉校验） | `feat: daily iteration D41 - nightly integration ci with trend reporting` |
 | D42 | MySQL 真机用例入 CI + 前置守卫 | `testing/preflight.py`（纯标准库：必需服务清单 `parse_required`、结果汇总 `PreflightReport.ok`/`failures`/`render`、逐服务探针 `preflight`、CLI `main`）；`pymysql` 纳入 `[mysql]` / `[dev]` extras；`integration.yml` 增 MySQL `services:` 容器、四个服务地址上提到作业级 `env`、pytest 之前插入守卫步骤（`MED_MEMORY_IT_REQUIRED` 任一不可用即失败）；`tests/test_integration/test_preflight.py`（离线）+ `tests/test_ci/test_integration_workflow.py` 增守卫与共享 env 规范 | `feat: daily iteration D42 - mysql live ci with required-service preflight guard` |
 | D43 | 集成套件按服务分片并行 | `testing/shards.py`（纯标准库：分片表 `Shard`/`SHARDS`、解析 `resolve_shard`/`select_shards`、汇总 `required_services`、渲染 `render_paths`/`render_required`/`render_compose`/`render_init`/`render_env`/`render_table`、CLI `main` 支持 `--format table\|paths\|required\|compose\|init\|env`）；`integration.yml` 改为四分片矩阵（`fail-fast: false`），中间件统一走 `docker compose up -d --wait <本分片服务>`（`services:` 无法按矩阵分片）、集群初始化由 `--format init` 驱动、报告/缓存/artifact 按分片隔离；`tests/test_integration/test_shards.py`（离线）+ `tests/test_ci/test_integration_workflow.py` 全面改写为分片契约与 CLI 交叉校验 | `feat: daily iteration D43 - shard the integration suite into parallel per-service jobs` |
+| D44 | 分片结果聚合汇总作业 | `testing/aggregate.py`（纯标准库：分片状态 `ShardStatus`、双布局路径探测 `shard_report_path`、收集 `collect_shard_reports`、聚合 `AggregateReport`/`build_aggregate`、Markdown 渲染 `render_markdown`、CLI `main` 退出码 `0/1/2/3` = 齐备无失败 / 缺报告 / 有失败 / 参数非法）；`integration.yml` 新增 `aggregate` 作业（`needs: integration` + `if: always()`：下载分片 artifact → 聚合 → 无条件贴总账进 Job Summary）；`tests/test_integration/test_aggregate.py`（离线 + 子进程 CLI）+ `tests/test_ci/test_integration_workflow.py` 增汇总作业契约 | `feat: daily iteration D44 - aggregate shard reports into a single summary job` |
 
 > 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`）；
 > ② 夜间趋势接入外部看板（如把摘要推送到 PR 评论 / 状态徽章）；
 > ③ 分片矩阵继续细分（如把集群分片的故障转移演练独立成更长的作业）；
-> ④ 把集成分片结果聚合成单个汇总作业，便于一眼看全貌。
+> ④ 汇总总账与上一轮基线对比（当前只在单分片粒度做趋势对比）。
 
 ---
 

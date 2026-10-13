@@ -115,7 +115,7 @@ src/med_langchain_memory/
 ├── privacy/       # 字段级正则脱敏（手机号 / 身份证 / 病历号 / 床号）
 ├── runnable/      # 医疗增强 Runnable：租户隔离、Token 裁剪、LLM 摘要、并发锁、降级熔断
 ├── api/           # FastAPI 会话管理接口
-├── testing/       # 集成测试支撑：探针/开关、CI 前置守卫、分片计划、集群演练与 JUnit 趋势（纯标准库）
+├── testing/       # 集成测试支撑：探针/开关、CI 前置守卫、分片计划、集群演练、JUnit 趋势与分片聚合（纯标准库）
 ├── config.py      # 全局配置（pydantic-settings）
 └── exceptions.py  # 统一异常体系
 ```
@@ -261,7 +261,7 @@ docker compose -f docker-compose.integration.yml down -v
 | 地址覆盖 | `MED_MEMORY_IT_REDIS_URL` / `MED_MEMORY_IT_MYSQL_URL` / `MED_MEMORY_IT_ELASTICSEARCH_URL` / `MED_MEMORY_IT_REDIS_CLUSTER_URL` |
 | 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引、hash tag 同 slot、集群 pipeline 语义、集群故障转移） |
 | MySQL 前置 | DBAPI 驱动 `pymysql` 随 `[mysql]` / `[dev]` extras 一起装，缺失时 MySQL 用例跳过 |
-| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；按服务**分片并行**，跑之前先过分片前置守卫，每个分片各自产出趋势摘要并滚动缓存报告供下次对比（见下） |
+| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；按服务**分片并行**，跑之前先过分片前置守卫，每个分片各自产出趋势摘要并滚动缓存报告供下次对比，最后由汇总作业把四份报告合成一份总账（见下） |
 
 探针与开关逻辑在 `med_langchain_memory/testing/services.py`，只用标准库，
 因此「能不能跑」的判断本身不依赖任何中间件客户端。
@@ -353,6 +353,43 @@ python -m med_langchain_memory.testing.trend reports/redis/integration.xml --out
 ```
 
 首次运行（没有基线）时基线列显示 `—`，不会报错。
+
+### 分片结果聚合（汇总作业）
+
+四个分片跑完后，`aggregate` 作业（`needs: integration` + `if: always()`）把四份 JUnit
+报告合成一份总账贴进 Job Summary，并给出**整轮唯一的结论退出码**——不必点开四个作业
+才知道今晚绿没绿：
+
+| 内容 | 说明 |
+|---|---|
+| 分片明细表 | 每个分片一行：用例数 / 通过 / 失败 / 跳过 / 通过率 / 耗时；缺报告的分片标 `⚠️ 无报告`，不伪造 0 数据 |
+| 合计行 | 只统计已解析的报告，通过率分母排除跳过用例 |
+| 缺失报告 | 逐片列出原因与期望路径（`reports/<分片>/integration.xml`） |
+| 失败用例 | 跨分片清单，带 `分片 · classname::name` 前缀，同名用例不会混淆 |
+| 最慢用例 | 跨分片排序的前 N 条（`--slowest`，默认 5） |
+
+聚合逻辑在 `med_langchain_memory/testing/aggregate.py`，**纯标准库**；用例明细的解析
+直接复用 `testing/trend.py`，不重复实现一遍 XML 解析：
+
+```bash
+python -m med_langchain_memory.testing.aggregate --reports-dir reports \
+  --output reports/integration-aggregate.md
+```
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 所有分片报告齐备且没有失败 / 错误用例 |
+| `1` | 有分片报告缺失或无法解析（CI 基础设施问题，禁止静默绿灯） |
+| `2` | 报告齐备但存在失败 / 错误用例 |
+| `3` | `--shard` 传了未知分片名（用法错误） |
+
+无论退出码是多少，汇总 Markdown 都会**先写出来**：工作流里「聚合」与「贴摘要」是两步，
+后者带 `if: always()`，所以聚合失败时最需要看的那份总账反而不会丢。
+
+报告目录两种布局都认：本地跑出来的 `reports/<分片>/integration.xml`，以及
+`actions/download-artifact` 解出来的 `reports/integration-report-<分片>/integration.xml`
+（目录名即 artifact 名）。期望聚合哪些分片由分片表决定，与上面的矩阵取值同源，
+工作流不重复声明一份分片清单。
 
 
 ### Redis Cluster（三主三从）

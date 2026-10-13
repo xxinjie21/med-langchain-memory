@@ -14,6 +14,10 @@ name: Integration
 # 中间件统一走 docker compose：`services:` 无法按矩阵分片（会让每个分片都拉起全部容器），
 # 而 Redis Cluster 本来就只能用 compose。compose 里每个长驻服务都有 healthcheck，
 # `up -d --wait` 会等到健康后再进入守卫与用例步骤。
+#
+# 汇总作业：四个分片跑完后由 `aggregate` 作业把四份 JUnit 报告聚合成一份总账
+# （分片明细 + 合计 + 缺失报告 + 失败用例）贴进 Job Summary，并用单一退出码
+# 给出整轮结论——不必点开四个作业才知道今晚绿没绿。
 on:
   workflow_dispatch:
   schedule:
@@ -121,3 +125,43 @@ jobs:
       - name: Tear down services
         if: always()
         run: docker compose -f docker-compose.integration.yml down -v
+
+  # 汇总作业：把四个分片的报告合成一份总账，并给出整轮唯一的结论退出码。
+  # 期望的分片清单由分片表决定（与上面矩阵取值同源），工作流不重复声明。
+  aggregate:
+    name: Aggregate shard reports
+    needs: integration
+    # 矩阵作业用 fail-fast: false 跑完四个分片，这里无论成败都要出总账。
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      # 四个分片的报告 artifact 解到 reports/ 下；目录名即 artifact 名，
+      # 聚合模块对这种「下载布局」与本地「reports/<分片>/」布局都认。
+      - name: Download shard reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: integration-report-*
+          path: reports
+
+      # 缺报告或存在失败用例时本步退出码非 0（整轮结论），但汇总文件已先写好。
+      - name: Aggregate shard reports
+        run: |
+          python -m med_langchain_memory.testing.aggregate \
+            --reports-dir reports \
+            --output "reports/integration-aggregate.md"
+
+      # 与上一步解耦：上一步失败也要把总账贴进 Job Summary，否则最需要的信息反而看不到。
+      - name: Publish aggregate summary
+        if: always()
+        run: cat "reports/integration-aggregate.md" >> "$GITHUB_STEP_SUMMARY"

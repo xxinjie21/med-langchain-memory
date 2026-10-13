@@ -6,12 +6,30 @@
 公开符号见 :mod:`med_langchain_memory.testing.services`（服务探测与开关）、
 :mod:`med_langchain_memory.testing.cluster`（集群拓扑解析与故障转移演练）、
 :mod:`med_langchain_memory.testing.trend`（JUnit 报告汇总与趋势对比）、
-:mod:`med_langchain_memory.testing.preflight`（CI 前置守卫：必需服务不可用即失败）与
-:mod:`med_langchain_memory.testing.shards`（集成套件按服务分片：并行作业的单一真值来源）。
+:mod:`med_langchain_memory.testing.preflight`（CI 前置守卫：必需服务不可用即失败）、
+:mod:`med_langchain_memory.testing.shards`（集成套件按服务分片：并行作业的单一真值来源）与
+:mod:`med_langchain_memory.testing.aggregate`（分片结果聚合：四个分片合成一份总账与单一退出码）。
 """
 
 from __future__ import annotations
 
+from .aggregate import (
+    AGGREGATE_SUMMARY_NAME,
+    ARTIFACT_PREFIX,
+    EXIT_FAILURES,
+    EXIT_INCOMPLETE,
+    EXIT_OK,
+    EXIT_USAGE,
+    AggregateReport,
+    ShardStatus,
+    build_aggregate,
+    collect_shard_reports,
+    shard_report_path,
+)
+
+# 注意：aggregate 的 CLI 入口（build_parser / main）同样**不**在此导出——
+# 包根这两个名字属于 trend 的 CLI。聚合入口按模块路径调用：
+# ``python -m med_langchain_memory.testing.aggregate``。
 from .cluster import (
     COMPOSE_PROJECT_NAME,
     DEFAULT_DOCKER_TIMEOUT_SECONDS,
@@ -99,7 +117,9 @@ from .trend import (
 )
 
 __all__ = [
+    "AGGREGATE_SUMMARY_NAME",
     "ALL_SHARDS",
+    "ARTIFACT_PREFIX",
     "BASELINE_REPORT_NAME",
     "CLUSTER_ANNOUNCE_ENV",
     "CLUSTER_INITIALIZER",
@@ -115,6 +135,10 @@ __all__ = [
     "DEFAULT_WAIT_SECONDS",
     "ENV_PREFIX",
     "ENV_REQUIRED",
+    "EXIT_FAILURES",
+    "EXIT_INCOMPLETE",
+    "EXIT_OK",
+    "EXIT_USAGE",
     "FAILOVER_WAIT_SECONDS",
     "FORMATS",
     "INTEGRATION_TEST_DIR",
@@ -123,6 +147,7 @@ __all__ = [
     "REDIS_CLUSTER_NODE_PORTS",
     "SHARDS",
     "TREND_SUMMARY_NAME",
+    "AggregateReport",
     "CaseResult",
     "ClusterNodeState",
     "DockerContainerController",
@@ -131,14 +156,17 @@ __all__ = [
     "PreflightReport",
     "ServiceStatus",
     "Shard",
+    "ShardStatus",
     "SuiteReport",
     "TrendReport",
+    "build_aggregate",
     "build_parser",
     "build_trend",
     "check_service",
     "cluster_container_name",
     "cluster_node_index",
     "cluster_startup_nodes",
+    "collect_shard_reports",
     "detect_host_address",
     "find_by_node_id",
     "integration_enabled",
@@ -164,6 +192,7 @@ __all__ = [
     "run_docker",
     "select_shards",
     "shard_names",
+    "shard_report_path",
     "wait_for_service",
     "wait_until",
 ]

@@ -72,7 +72,8 @@ LLM 本身无状态，对话的「记忆」必须由外部存储承担。本库�
 │  ├─ cluster.py   集群拓扑解析 + 故障转移目标选择 + docker 容器控制 + 轮询  │
 │  ├─ trend.py     JUnit 报告汇总 + 趋势对比 + Markdown 渲染             │
 │  ├─ preflight.py 必需服务前置守卫：不可达即失败（防「集体跳过」假绿灯）│
-│  └─ shards.py    集成套件按服务分片：用例路径/服务/compose 名/环境变量的单一真值源│
+│  ├─ shards.py    集成套件按服务分片：用例路径/服务/compose 名/环境变量的单一真值源│
+│  └─ aggregate.py 分片结果聚合：四片报告合成一份总账 + 整轮唯一的结论退出码  │
 ├──────────────────────────────────────────────────────────────────────┤
 │  serde/          序列化层：Serializer 抽象 + ProtobufSerializer          │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -416,6 +417,37 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 
 ---
 
+### ADR-16 · 分片结果用一个汇总作业聚合成总账，而不是让人点开四个作业
+
+**决策**：在矩阵作业之后追加 `aggregate` 作业（`needs: integration` + `if: always()`），
+把四个分片的 JUnit 报告聚合成一份 Markdown 总账写进 Job Summary，
+并用**单一退出码**给出整轮集成测试的结论。聚合逻辑放在纯标准库模块
+`med_langchain_memory.testing.aggregate`：
+
+| 关注点 | 实现 | 为什么这样切 |
+|---|---|---|
+| 期望分片清单 | `collect_shard_reports` 默认取 `shards.shard_names()` | 与矩阵取值同源，工作流不重复声明分片清单 |
+| 用例明细解析 | 复用 `trend.parse_junit_report` | 不重复实现一遍 XML 解析，口径与单分片摘要逐字一致 |
+| 报告目录布局 | `shard_report_path`：先认 `reports/<分片>/`，再认 `reports/<artifact 名>/` | 本地跑出的布局与 `download-artifact` 解出的布局都能吃下 |
+| 结论退出码 | `0` 齐备无失败 / `1` 缺报告或解析失败 / `2` 有失败用例 / `3` 参数非法 | 「缺报告」与「有失败」是两类问题，必须能分开定位 |
+| 摘要与退出码解耦 | 先写 Markdown 再返回退出码；工作流「聚合」与「贴摘要」分两步，后者 `if: always()` | 聚合失败时最需要看的那份总账不会因为步骤中断而丢失 |
+| 聚合作业不拉容器 | 只读 artifact | 汇总不需要中间件，避免重复支付冷启动成本 |
+
+**理由**：
+
+* 分片并行把墙钟时间压到「最慢的那一片」，代价是结论被切成四份；
+  人要知道「今晚到底绿没绿」得点开四个作业，反而比串行更贵——聚合把这份成本收回来；
+* 「缺报告」在单分片视角里不可见（没报告就是没跑过），但在总账里它是
+  **CI 基础设施故障**的明确信号：矩阵作业在 pytest 之前挂掉（compose 起不来、
+  守卫失败）时不会有 JUnit 文件，聚合据此给出退出码 `1`，而不是安静地少算一片；
+* 聚合只是**读文件 + 计数**，因此可以完全离线单测（合成 JUnit XML），
+  不引入任何新的中间件依赖。
+
+**代价**：多一个作业（多一次 checkout / setup-python / 下载 artifact 的开销）；
+Job Summary 里总账与四份分片摘要并存，需要一点阅读顺序上的约定（总账在最后）。
+
+---
+
 ## 5. 并发与可用性
 
 | 机制 | 实现 | 降级路径 |
@@ -471,6 +503,7 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 | 分片并行 | `testing/shards.py` 把真机套件按服务切成四个矩阵分片（`redis` / `mysql` / `elasticsearch` / `redis-cluster`），每个分片只拉起自己的容器；分片表是单一真值来源，工作流不硬编码任何服务地址 / 分片名 / 容器名；离线单测在 `tests/test_integration/test_shards.py` |
 | 假绿灯防护 | `testing/preflight.py` 按 `MED_MEMORY_IT_REQUIRED` 逐个探针，任一必需服务不可用即退出码 1——否则「用例集体 skip」会让环境故障伪装成通过；离线单测在 `tests/test_integration/test_preflight.py` |
 | 夜间趋势上报 | `testing/trend.py` 解析 JUnit 报告渲染 Markdown 摘要写入 Job Summary，报告经 `actions/cache` **按分片**滚动为下次基线；离线单测在 `tests/test_integration/test_trend.py` |
+| 分片结果聚合 | `testing/aggregate.py` 把四个分片的报告聚合成一份总账（分片明细 + 合计 + 缺失报告 + 失败用例 + 最慢用例）写入 Job Summary，并以退出码 `0/1/2/3` 区分「齐备无失败 / 缺报告 / 有失败 / 参数非法」；离线单测在 `tests/test_integration/test_aggregate.py` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |

@@ -23,6 +23,9 @@ These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
   (Linux runners) and every container must be torn down afterwards;
 * each shard must emit its own JUnit report, render a Markdown trend summary into
   ``$GITHUB_STEP_SUMMARY`` and roll the report forward through a **per-shard** cache;
+* the ``aggregate`` job must depend on the matrix job, run ``if: always()``, download
+  every shard report through the real ``ARTIFACT_PREFIX``, aggregate with the real CLI
+  options and publish the combined summary even when the aggregation step itself fails;
 * the ``integration`` marker must be registered in ``pyproject.toml``
   (``--strict-markers`` is enabled, so an unregistered marker fails the run);
 * every ``uses:`` reference must stay pinned to a major version tag.
@@ -47,6 +50,14 @@ from med_langchain_memory.testing import (
     resolve_shard,
     select_shards,
     shard_names,
+)
+from med_langchain_memory.testing.aggregate import (
+    AGGREGATE_SUMMARY_NAME,
+    ARTIFACT_PREFIX,
+    collect_shard_reports,
+)
+from med_langchain_memory.testing.aggregate import (
+    build_parser as build_aggregate_parser,
 )
 from med_langchain_memory.testing.preflight import build_parser as build_preflight_parser
 from med_langchain_memory.testing.shards import build_parser as build_shards_parser
@@ -79,6 +90,9 @@ PREFLIGHT_MODULE = "med_langchain_memory.testing.preflight"
 #: 分片解析的模块入口（与 ``testing/shards.py`` 的 CLI 对齐）。
 SHARDS_MODULE = "med_langchain_memory.testing.shards"
 
+#: 分片结果聚合的模块入口（与 ``testing/aggregate.py`` 的 CLI 对齐）。
+AGGREGATE_MODULE = "med_langchain_memory.testing.aggregate"
+
 #: 工作流里的矩阵表达式（断言前统一替换成字面分片名）。
 SHARD_EXPRESSION = "${{ matrix.shard }}"
 
@@ -88,9 +102,17 @@ SAMPLE_SHARD = "redis"
 #: 每个分片自己的报告目录（矩阵表达式保留，便于断言目录结构）。
 SHARD_REPORT_DIR = f"reports/{SHARD_EXPRESSION}"
 
+#: 汇总作业下载 artifact 的目标目录（聚合模块的 ``--reports-dir``）。
+AGGREGATE_REPORTS_DIR = "reports"
+
 #: ``python -m <module> ...`` 调用整段（含续行），用于交叉校验 CLI 选项。
 TREND_INVOCATION_PATTERN = re.compile(
     rf"python -m {re.escape(TREND_MODULE)}(?P<args>(?:[^\n]*\\\n)*[^\n]*)"
+)
+
+#: 聚合 CLI 的调用整段（工作流里同样用 ``\`` 续行）。
+AGGREGATE_INVOCATION_PATTERN = re.compile(
+    rf"python -m {re.escape(AGGREGATE_MODULE)}(?P<args>(?:[^\n]*\\\n)*[^\n]*)"
 )
 
 #: ``python -m ...shards`` 调用到第一个 shell 元字符为止的参数段。
@@ -133,6 +155,24 @@ def shards_invocations() -> list[str]:
     matches = SHARDS_INVOCATION_PATTERN.findall(rendered_workflow())
     assert matches, f"{SHARDS_MODULE} is never invoked by the workflow"
     return [match.strip() for match in matches]
+
+
+def aggregate_arguments() -> list[str]:
+    """Return the CLI tokens passed to the aggregate module inside the workflow."""
+    match = AGGREGATE_INVOCATION_PATTERN.search(read_workflow())
+    assert match is not None, f"{AGGREGATE_MODULE} is never invoked by the workflow"
+    return shlex.split(match.group("args").replace("\\\n", " "))
+
+
+def step_body(name: str) -> str:
+    """Return the YAML body of a workflow step (truncated at the next step)."""
+    match = re.search(
+        rf"- name: {re.escape(name)}\n(?P<body>.*?)(?=\n\s*- name:|\Z)",
+        read_workflow(),
+        re.DOTALL,
+    )
+    assert match is not None, f"step {name!r} is missing from the workflow"
+    return match.group("body")
 
 
 class TestWorkflowFile:
@@ -384,6 +424,70 @@ class TestTrendReporting:
         assert parsed.report == Path("reports") / SAMPLE_SHARD / JUNIT_REPORT_NAME
         assert parsed.baseline == Path("reports") / SAMPLE_SHARD / BASELINE_REPORT_NAME
         assert parsed.output == Path("reports") / SAMPLE_SHARD / TREND_SUMMARY_NAME
+
+
+class TestAggregateJob:
+    """汇总作业：把四个分片的报告合成一份总账，并给出整轮唯一的结论退出码。"""
+
+    def test_job_waits_for_the_matrix_and_always_runs(self) -> None:
+        """正向：汇总作业依赖矩阵作业，且无论矩阵成败都要出总账。"""
+        text = read_workflow()
+        match = re.search(
+            r"^ {2}aggregate:\n(?P<body>.*?)(?=\n {2}\S|\Z)", text, re.MULTILINE | re.DOTALL
+        )
+        assert match is not None, "the aggregate job is missing"
+        body = match.group("body")
+        assert re.search(r"needs:\s*integration\b", body)
+        assert re.search(r"if:\s*always\(\)", body)
+
+    def test_aggregate_runs_after_the_matrix_job(self) -> None:
+        """边界：作业顺序必须是矩阵在前、汇总在后（``needs`` 的实际语义）。"""
+        text = read_workflow()
+        assert text.index("\n  integration:\n") < text.index("\n  aggregate:\n")
+
+    def test_downloads_every_shard_artifact_by_prefix(self) -> None:
+        """正向：按 artifact 名前缀一次性下载四个分片的报告目录。"""
+        text = read_workflow()
+        assert "actions/download-artifact@v4" in text
+        assert f"pattern: {ARTIFACT_PREFIX}*" in text
+        assert f"path: {AGGREGATE_REPORTS_DIR}" in text
+
+    def test_aggregate_cli_is_invoked_with_real_options(self) -> None:
+        """边界：工作流传给聚合 CLI 的参数必须能被真实解析器解析通过。"""
+        parsed = build_aggregate_parser().parse_args(aggregate_arguments())
+        assert parsed.reports_dir == Path(AGGREGATE_REPORTS_DIR)
+        assert parsed.output == Path(AGGREGATE_REPORTS_DIR) / AGGREGATE_SUMMARY_NAME
+        # 不限定分片：期望清单由分片表给出，与矩阵取值同源。
+        assert parsed.shard == []
+
+    def test_publishes_the_summary_even_when_aggregation_fails(self) -> None:
+        """边界：聚合步骤失败（缺报告 / 有失败用例）时总账仍要贴进 Job Summary。"""
+        body = step_body("Publish aggregate summary")
+        assert re.search(r"if:\s*always\(\)", body)
+        assert f'cat "{AGGREGATE_REPORTS_DIR}/{AGGREGATE_SUMMARY_NAME}"' in body
+        assert '"$GITHUB_STEP_SUMMARY"' in body
+
+    def test_expected_shards_come_from_the_shard_table(self) -> None:
+        """正向：汇总默认期望的分片就是分片表的全部条目（与矩阵逐字同源）。"""
+        statuses = collect_shard_reports(Path("no-such-reports"))
+        assert tuple(status.name for status in statuses) == shard_names()
+        assert all(not status.present for status in statuses)
+
+    def test_aggregate_job_starts_no_services(self) -> None:
+        """边界：汇总作业只读 artifact，不得再拉起任何中间件容器。"""
+        match = re.search(
+            r"^ {2}aggregate:\n(?P<body>.*?)(?=\n {2}\S|\Z)",
+            read_workflow(),
+            re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None
+        assert "docker compose" not in match.group("body")
+
+    def test_readme_documents_the_aggregate_job(self) -> None:
+        """正向：README 必须说明汇总作业与聚合入口（否则改聚合口径没人知道）。"""
+        readme = README_PATH.read_text(encoding="utf-8")
+        assert AGGREGATE_MODULE in readme
+        assert AGGREGATE_SUMMARY_NAME in readme
 
 
 class TestActionPinning:
