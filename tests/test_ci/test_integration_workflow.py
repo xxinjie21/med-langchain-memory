@@ -26,6 +26,9 @@ These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
 * the ``aggregate`` job must depend on the matrix job, run ``if: always()``, download
   every shard report through the real ``ARTIFACT_PREFIX``, aggregate with the real CLI
   options and publish the combined summary even when the aggregation step itself fails;
+* the ``aggregate`` job must also roll a **ledger baseline** forward (``actions/cache``
+  keyed by run id, restored before aggregation) and pass ``--baseline-dir`` /
+  ``--snapshot-dir`` so the combined summary can be diffed against the previous run;
 * the ``integration`` marker must be registered in ``pyproject.toml``
   (``--strict-markers`` is enabled, so an unregistered marker fails the run);
 * every ``uses:`` reference must stay pinned to a major version tag.
@@ -54,6 +57,7 @@ from med_langchain_memory.testing import (
 from med_langchain_memory.testing.aggregate import (
     AGGREGATE_SUMMARY_NAME,
     ARTIFACT_PREFIX,
+    BASELINE_LEDGER_DIR,
     collect_shard_reports,
 )
 from med_langchain_memory.testing.aggregate import (
@@ -104,6 +108,9 @@ SHARD_REPORT_DIR = f"reports/{SHARD_EXPRESSION}"
 
 #: 汇总作业下载 artifact 的目标目录（聚合模块的 ``--reports-dir``）。
 AGGREGATE_REPORTS_DIR = "reports"
+
+#: 汇总作业滚动总账基线的缓存键前缀（与工作流里的 ``key:`` / ``restore-keys:`` 一致）。
+BASELINE_CACHE_PREFIX = "integration-baseline-"
 
 #: ``python -m <module> ...`` 调用整段（含续行），用于交叉校验 CLI 选项。
 TREND_INVOCATION_PATTERN = re.compile(
@@ -172,6 +179,15 @@ def step_body(name: str) -> str:
         re.DOTALL,
     )
     assert match is not None, f"step {name!r} is missing from the workflow"
+    return match.group("body")
+
+
+def aggregate_job_body() -> str:
+    """Return the YAML body of the ``aggregate`` job (truncated at the next job)."""
+    match = re.search(
+        r"^ {2}aggregate:\n(?P<body>.*?)(?=\n {2}\S|\Z)", read_workflow(), re.MULTILINE | re.DOTALL
+    )
+    assert match is not None, "the aggregate job is missing"
     return match.group("body")
 
 
@@ -431,12 +447,7 @@ class TestAggregateJob:
 
     def test_job_waits_for_the_matrix_and_always_runs(self) -> None:
         """正向：汇总作业依赖矩阵作业，且无论矩阵成败都要出总账。"""
-        text = read_workflow()
-        match = re.search(
-            r"^ {2}aggregate:\n(?P<body>.*?)(?=\n {2}\S|\Z)", text, re.MULTILINE | re.DOTALL
-        )
-        assert match is not None, "the aggregate job is missing"
-        body = match.group("body")
+        body = aggregate_job_body()
         assert re.search(r"needs:\s*integration\b", body)
         assert re.search(r"if:\s*always\(\)", body)
 
@@ -475,19 +486,67 @@ class TestAggregateJob:
 
     def test_aggregate_job_starts_no_services(self) -> None:
         """边界：汇总作业只读 artifact，不得再拉起任何中间件容器。"""
-        match = re.search(
-            r"^ {2}aggregate:\n(?P<body>.*?)(?=\n {2}\S|\Z)",
-            read_workflow(),
-            re.MULTILINE | re.DOTALL,
-        )
-        assert match is not None
-        assert "docker compose" not in match.group("body")
+        assert "docker compose" not in aggregate_job_body()
 
     def test_readme_documents_the_aggregate_job(self) -> None:
         """正向：README 必须说明汇总作业与聚合入口（否则改聚合口径没人知道）。"""
         readme = README_PATH.read_text(encoding="utf-8")
         assert AGGREGATE_MODULE in readme
         assert AGGREGATE_SUMMARY_NAME in readme
+
+
+class TestAggregateBaseline:
+    """总账基线：汇总作业自己把上一轮报告滚动起来，好让总账能和上一轮对比。"""
+
+    def test_restores_the_ledger_baseline_from_a_rolling_cache(self) -> None:
+        """正向：基线与分片报告一样走 ``actions/cache`` 滚动（key 带 run_id + 前缀恢复）。"""
+        body = step_body("Restore previous ledger baseline")
+        assert "actions/cache@v4" in body
+        assert f"path: {BASELINE_LEDGER_DIR}" in body
+        assert f"key: {BASELINE_CACHE_PREFIX}${{{{ github.run_id }}}}" in body
+        assert re.search(r"restore-keys:\s*\|", body)
+
+    def test_baseline_is_restored_before_aggregation(self) -> None:
+        """边界：基线必须在聚合之前恢复，否则对比永远拿不到上一轮数据。"""
+        body = aggregate_job_body()
+        restore = body.index("- name: Restore previous ledger baseline")
+        assert restore < body.index("- name: Aggregate shard reports")
+
+    def test_aggregate_cli_uses_the_ledger_baseline_dir(self) -> None:
+        """正向：聚合 CLI 的 ``--baseline-dir`` / ``--snapshot-dir`` 都指向基线目录。"""
+        parsed = build_aggregate_parser().parse_args(aggregate_arguments())
+        assert parsed.baseline_dir == Path(BASELINE_LEDGER_DIR)
+        assert parsed.snapshot_dir == Path(BASELINE_LEDGER_DIR)
+
+    def test_aggregate_options_exist_in_the_real_parser(self) -> None:
+        """边界：工作流传给聚合 CLI 的每个长选项都必须真实存在。"""
+        known = {
+            option
+            for action in build_aggregate_parser()._actions
+            for option in action.option_strings
+        }
+        flags = [token for token in aggregate_arguments() if token.startswith("--")]
+        assert flags, "workflow must pass options to the aggregate module"
+        unknown = [flag for flag in flags if flag not in known]
+        assert unknown == [], f"workflow references unknown aggregate options: {unknown}"
+
+    def test_baseline_dir_does_not_collide_with_the_reports_dir(self) -> None:
+        """边界：基线目录必须与 artifact 下载目录分开，否则会被下一轮的报告覆盖。"""
+        assert BASELINE_LEDGER_DIR != AGGREGATE_REPORTS_DIR
+        assert f"path: {BASELINE_LEDGER_DIR}" in read_workflow()
+
+    def test_baseline_dir_is_gitignored(self) -> None:
+        """边界：本地跑 ``--snapshot-dir`` 会在仓库根建目录，必须不进版本库。"""
+        ignored = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
+        assert f"{BASELINE_LEDGER_DIR}/" in ignored
+
+    def test_readme_documents_the_ledger_comparison(self) -> None:
+        """正向：README 必须说明总账与上一轮的对比（否则改口径没人知道）。"""
+        readme = README_PATH.read_text(encoding="utf-8")
+        assert BASELINE_LEDGER_DIR in readme
+        assert "--baseline-dir" in readme
+        assert "--snapshot-dir" in readme
+        assert "与上一轮对比" in readme
 
 
 class TestActionPinning:

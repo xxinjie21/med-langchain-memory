@@ -18,6 +18,9 @@ name: Integration
 # 汇总作业：四个分片跑完后由 `aggregate` 作业把四份 JUnit 报告聚合成一份总账
 # （分片明细 + 合计 + 缺失报告 + 失败用例）贴进 Job Summary，并用单一退出码
 # 给出整轮结论——不必点开四个作业才知道今晚绿没绿。
+# 总账本身还会与**上一轮总账**对比（用例数 / 失败数 / 通过率 / 耗时的变化 +
+# 逐分片状态 + 跨分片的新增失败与已修复）：上一轮的报告由本作业末尾的快照
+# 写进 `baseline/`，靠滚动缓存传给下一次运行，不需要任何外部存储。
 on:
   workflow_dispatch:
   schedule:
@@ -154,11 +157,25 @@ jobs:
           pattern: integration-report-*
           path: reports
 
-      # 缺报告或存在失败用例时本步退出码非 0（整轮结论），但汇总文件已先写好。
+      # 滚动总账基线：恢复上一轮由 --snapshot-dir 写下的四个分片报告，
+      # 本轮聚合时据此给出「整轮 vs 上一轮」的对比。key 带 run_id 保证每次都写新条目，
+      # restore-keys 前缀命中上一次；首次运行缓存未命中时不渲染对比小节。
+      - name: Restore previous ledger baseline
+        uses: actions/cache@v4
+        with:
+          path: baseline
+          key: integration-baseline-${{ github.run_id }}
+          restore-keys: |
+            integration-baseline-
+
+      # 缺报告或存在失败用例时本步退出码非 0（整轮结论），但汇总文件已先写好；
+      # 同时把本轮报告快照进 baseline/，随缓存滚动给下一轮当基线。
       - name: Aggregate shard reports
         run: |
           python -m med_langchain_memory.testing.aggregate \
             --reports-dir reports \
+            --baseline-dir baseline \
+            --snapshot-dir baseline \
             --output "reports/integration-aggregate.md"
 
       # 与上一步解耦：上一步失败也要把总账贴进 Job Summary，否则最需要的信息反而看不到。

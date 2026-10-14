@@ -16,6 +16,13 @@ JUnit 报告聚合成一份汇总（分片明细表 + 合计行 + 缺失报告�
 * 兼容两种报告目录布局：本地跑出来的 ``reports/<分片>/integration.xml``，
   以及 ``actions/download-artifact`` 解出来的
   ``reports/integration-report-<分片>/integration.xml``（目录名即 artifact 名）；
+* **总账也能和上一轮比**：D41 的趋势对比只到「单个分片 vs 该分片上一次」这一粒度，
+  要回答「今晚整轮比昨晚好了还是差了、是哪一片退化了」还得自己把四份摘要拼起来。
+  因此本模块在聚合之上再加一层 :class:`AggregateTrend`：拿 ``--baseline-dir`` 里的
+  上一轮分片报告算出**整轮合计的变化**（用例数 / 失败数 / 通过率 / 耗时）、
+  **逐分片变化**（失败数与通过率的变化 + 状态标记）以及跨分片的
+  **新增失败 / 已修复**清单；``--snapshot-dir`` 把本轮报告按规范布局存一份，
+  工作流用滚动缓存把它喂给下一轮，于是对比不需要任何外部存储；
 * 只做计数、排序与聚合，不读取、不处理任何测试输出文本内容。
 
 退出码（汇总作业的整轮结论）：
@@ -38,10 +45,12 @@ JUnit 报告聚合成一份汇总（分片明细表 + 合计行 + 缺失报告�
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from med_langchain_memory.exceptions import ValidationError
 
@@ -60,6 +69,12 @@ ARTIFACT_PREFIX = "integration-report-"
 
 #: 聚合摘要文件名（汇总作业写进 Job Summary 的那份）。
 AGGREGATE_SUMMARY_NAME = "integration-aggregate.md"
+
+#: 上一轮总账基线的默认目录（汇总作业从滚动缓存恢复到这里，并在这里写本轮快照）。
+BASELINE_LEDGER_DIR = "baseline"
+
+#: 单个分片相对上一轮基线的状态。
+ShardDeltaState = Literal["absent", "added", "removed", "regressed", "improved", "unchanged"]
 
 #: 退出码：报告齐备且无失败用例。
 EXIT_OK = 0
@@ -160,6 +175,41 @@ def collect_shard_reports(
     return tuple(statuses)
 
 
+def snapshot_reports(
+    reports_dir: Path,
+    target_dir: Path,
+    shards: Sequence[str] | None = None,
+) -> tuple[Path, ...]:
+    """把本轮各分片的报告按规范布局复制一份到 ``target_dir``（供下一轮当基线）。
+
+    与 :func:`collect_shard_reports` 一样兼容两种来源布局，但**只按规范布局写出**
+    ``<target_dir>/<分片>/integration.xml``——基线目录因此始终是单一定型结构，
+    读取方（``--baseline-dir``）不必再猜布局。
+
+    Args:
+        reports_dir: 本轮报告根目录。
+        target_dir: 目标目录（工作流里是 :data:`BASELINE_LEDGER_DIR`）。
+        shards: 分片名序列；``None`` / 空序列 / 含 ``all`` 时取全部分片。
+
+    Returns:
+        实际写出的文件路径元组；只包含成功解析的报告，顺序与分片表一致。
+
+    Raises:
+        ValidationError: ``shards`` 含未知分片名时。
+    """
+    written: list[Path] = []
+    for status in collect_shard_reports(reports_dir, shards):
+        if not status.present:
+            continue
+        target = target_dir / status.name / JUNIT_REPORT_NAME
+        if status.path.resolve() == target.resolve():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(status.path, target)
+        written.append(target)
+    return tuple(written)
+
+
 @dataclass(frozen=True)
 class AggregateReport:
     """全部分片的聚合结果。"""
@@ -258,6 +308,188 @@ def build_aggregate(statuses: Sequence[ShardStatus]) -> AggregateReport:
     return AggregateReport(statuses=tuple(statuses))
 
 
+@dataclass(frozen=True)
+class ShardDelta:
+    """单个分片在本轮与上一轮基线之间的差异。"""
+
+    #: 分片名。
+    name: str
+
+    #: 人类可读的分片标题。
+    title: str
+
+    #: 本轮该分片的报告；本轮缺报告时为 ``None``。
+    current: SuiteReport | None = None
+
+    #: 基线里该分片的报告；基线缺该片时为 ``None``。
+    baseline: SuiteReport | None = None
+
+    @property
+    def comparable(self) -> bool:
+        """本轮与基线都有该分片的报告时才可比较。"""
+        return self.current is not None and self.baseline is not None
+
+    @property
+    def state(self) -> ShardDeltaState:
+        """分片状态：新增 / 缺报告 / 回退 / 改善 / 持平。
+
+        判定顺序：先看两侧是否都有报告，再比失败（错误）用例数，
+        失败数相同则比通过率（用例增删导致的通过率变化也算变化）。
+        """
+        current = self.current
+        baseline = self.baseline
+        if current is None and baseline is None:
+            return "absent"
+        if baseline is None:
+            return "added"
+        if current is None:
+            return "removed"
+        if current.failed != baseline.failed:
+            return "regressed" if current.failed > baseline.failed else "improved"
+        if current.pass_rate != baseline.pass_rate:
+            return "improved" if current.pass_rate > baseline.pass_rate else "regressed"
+        return "unchanged"
+
+    @property
+    def failed_delta(self) -> int | None:
+        """失败 + 错误用例数的变化；不可比较时为 ``None``。"""
+        if self.current is None or self.baseline is None:
+            return None
+        return self.current.failed - self.baseline.failed
+
+    @property
+    def total_delta(self) -> int | None:
+        """用例总数的变化；不可比较时为 ``None``。"""
+        if self.current is None or self.baseline is None:
+            return None
+        return self.current.total - self.baseline.total
+
+    @property
+    def pass_rate_delta(self) -> float | None:
+        """通过率的变化（本轮 - 基线，保留 4 位）；不可比较时为 ``None``。"""
+        if self.current is None or self.baseline is None:
+            return None
+        return round(self.current.pass_rate - self.baseline.pass_rate, 4)
+
+
+@dataclass(frozen=True)
+class AggregateTrend:
+    """整轮总账相对上一轮基线的对比结果。
+
+    基线的粒度就是「上一轮的四个分片报告」：既给出整轮合计的变化，也给出逐分片的变化，
+    因此「今晚比昨晚差了没有、是哪一片退化了」一眼可见（单分片粒度的趋势见
+    :mod:`med_langchain_memory.testing.trend`）。
+
+    基线不齐（上一轮有分片在 pytest 之前就挂了，没产出 JUnit）时对比**仍然可用**，
+    只是只覆盖有报告的那些分片；此时 :attr:`baseline_complete` 为 ``False``，
+    渲染出的对比小节会显式列出缺哪几片，避免把「少了一片」误读成「用例变少了」。
+    """
+
+    #: 本轮总账。
+    current: AggregateReport
+
+    #: 上一轮总账；``None`` 表示首次运行，无对比基线。
+    baseline: AggregateReport | None = None
+
+    @property
+    def available(self) -> bool:
+        """是否存在可用基线（至少解析出一个基线分片报告）。"""
+        baseline = self.baseline
+        return baseline is not None and bool(baseline.reports)
+
+    @property
+    def baseline_complete(self) -> bool:
+        """基线是否每个分片的报告都齐备（无基线时为 ``False``）。"""
+        baseline = self.baseline
+        return baseline is not None and baseline.complete
+
+    @property
+    def shards(self) -> tuple[ShardDelta, ...]:
+        """逐分片差异（顺序即分片表顺序）；无可用基线时为空元组。"""
+        baseline = self.baseline
+        if baseline is None or not baseline.reports:
+            return ()
+        known = {status.name: status.report for status in baseline.statuses}
+        return tuple(
+            ShardDelta(
+                name=status.name,
+                title=status.title,
+                current=status.report,
+                baseline=known.get(status.name),
+            )
+            for status in self.current.statuses
+        )
+
+    @property
+    def new_failures(self) -> tuple[tuple[str, CaseResult], ...]:
+        """本轮失败、但基线未失败的用例（``(分片名, 用例)``）；无基线时为空。"""
+        baseline = self.baseline
+        if baseline is None or not baseline.reports:
+            return ()
+        known = {(shard, case.node_id) for shard, case in baseline.failures()}
+        return tuple(
+            pair for pair in self.current.failures() if (pair[0], pair[1].node_id) not in known
+        )
+
+    @property
+    def fixed(self) -> tuple[tuple[str, CaseResult], ...]:
+        """基线失败、本轮不再失败的用例（``(分片名, 用例)``）；无基线时为空。"""
+        baseline = self.baseline
+        if baseline is None or not baseline.reports:
+            return ()
+        failing_now = {(shard, case.node_id) for shard, case in self.current.failures()}
+        return tuple(
+            pair for pair in baseline.failures() if (pair[0], pair[1].node_id) not in failing_now
+        )
+
+    @property
+    def total_delta(self) -> int | None:
+        """整轮用例总数的变化；无基线时为 ``None``。"""
+        baseline = self.baseline
+        if baseline is None or not baseline.reports:
+            return None
+        return self.current.total - baseline.total
+
+    @property
+    def failed_delta(self) -> int | None:
+        """整轮失败 + 错误用例数的变化；无基线时为 ``None``。"""
+        baseline = self.baseline
+        if baseline is None or not baseline.reports:
+            return None
+        return self.current.failed - baseline.failed
+
+    @property
+    def pass_rate_delta(self) -> float | None:
+        """整轮通过率的变化（本轮 - 基线，保留 4 位）；无基线时为 ``None``。"""
+        baseline = self.baseline
+        if baseline is None or not baseline.reports:
+            return None
+        return round(self.current.pass_rate - baseline.pass_rate, 4)
+
+    @property
+    def duration_delta(self) -> float | None:
+        """整轮耗时的变化（秒，保留 3 位）；无基线时为 ``None``。"""
+        baseline = self.baseline
+        if baseline is None or not baseline.reports:
+            return None
+        return round(self.current.duration - baseline.duration, 3)
+
+
+def build_aggregate_trend(
+    current: AggregateReport, baseline: AggregateReport | None = None
+) -> AggregateTrend:
+    """组装总账对比。
+
+    Args:
+        current: 本轮总账。
+        baseline: 上一轮总账；``None`` 表示首次运行。
+
+    Returns:
+        :class:`AggregateTrend`。
+    """
+    return AggregateTrend(current=current, baseline=baseline)
+
+
 def _section(title: str, bullets: Sequence[str], *, empty: str) -> list[str]:
     """把一组条目渲染成 Markdown 小节（为空时输出 ``empty`` 占位句）。"""
     lines = [f"### {title}", ""]
@@ -286,12 +518,119 @@ def _case_lines(pairs: Sequence[tuple[str, CaseResult]], *, with_duration: bool)
     return lines
 
 
-def render_markdown(report: AggregateReport, *, slowest_limit: int = DEFAULT_SLOWEST_LIMIT) -> str:
+#: 分片状态在对比表里的中文标记。
+_STATE_LABELS: dict[ShardDeltaState, str] = {
+    "absent": "—",
+    "added": "新增",
+    "removed": "⚠️ 缺报告",
+    "regressed": "⚠️ 回退",
+    "improved": "✅ 改善",
+    "unchanged": "持平",
+}
+
+
+def _delta_text(value: int | float | None, *, percent: bool = False, unit: str = "") -> str:
+    """渲染带符号的变化值；``None``（不可比较）渲染成 ``—``。
+
+    Args:
+        value: 变化量；``None`` 表示两侧不可比（缺报告）。
+        percent: 按百分比渲染（保留 2 位）。
+        unit: 非空时按 3 位小数加单位渲染（如 ``s``）。
+    """
+    if value is None:
+        return "—"
+    if percent:
+        return f"{value:+.2%}"
+    if unit:
+        return f"{value:+.3f}{unit}"
+    return f"{value:+d}"
+
+
+def _progress(report: SuiteReport) -> str:
+    """渲染「通过 / 可执行」进度（分母排除跳过用例）。"""
+    return f"{report.passed}/{report.total - report.skipped}"
+
+
+def _delta_row(delta: ShardDelta) -> str:
+    """渲染逐分片对比表的一行（任一侧缺报告时变化列渲染成 ``—``，不伪造 0）。"""
+    current = delta.current
+    baseline = delta.baseline
+    current_cell = "—" if current is None else _progress(current)
+    baseline_cell = "—" if baseline is None else _progress(baseline)
+    failed = _delta_text(delta.failed_delta)
+    rate = _delta_text(delta.pass_rate_delta, percent=True)
+    return (
+        f"| `{delta.name}` | {current_cell} | {baseline_cell} | {failed} | {rate} "
+        f"| {_STATE_LABELS[delta.state]} |"
+    )
+
+
+def _comparison_section(trend: AggregateTrend) -> list[str]:
+    """渲染「与上一轮对比」小节；无可用基线时返回空列表（首次运行不出现该小节）。"""
+    baseline = trend.baseline
+    if baseline is None or not baseline.reports:
+        return []
+    current = trend.current
+    lines = [
+        "### 与上一轮对比",
+        "",
+        "| 指标 | 本次 | 基线 | 变化 |",
+        "|---|---|---|---|",
+        f"| 用例总数 | {current.total} | {baseline.total} | {_delta_text(trend.total_delta)} |",
+        f"| 通过 | {current.passed} | {baseline.passed} | "
+        f"{_delta_text(current.passed - baseline.passed)} |",
+        f"| 失败/错误 | {current.failed} | {baseline.failed} | {_delta_text(trend.failed_delta)} |",
+        f"| 跳过 | {current.skipped} | {baseline.skipped} | "
+        f"{_delta_text(current.skipped - baseline.skipped)} |",
+        f"| 通过率 | {current.pass_rate:.2%} | {baseline.pass_rate:.2%} | "
+        f"{_delta_text(trend.pass_rate_delta, percent=True)} |",
+        f"| 总耗时 | {current.duration:.3f}s | {baseline.duration:.3f}s | "
+        f"{_delta_text(trend.duration_delta, unit='s')} |",
+        "",
+    ]
+    if trend.baseline_complete:
+        lines += [
+            f"基线报告齐备（{len(baseline.reports)}/{len(baseline.statuses)} 个分片），"
+            f"通过率变化 **{_delta_text(trend.pass_rate_delta, percent=True)}**",
+            "",
+        ]
+    else:
+        missing = ", ".join(status.name for status in baseline.missing)
+        lines += [
+            f"⚠️ 基线只有 {len(baseline.reports)}/{len(baseline.statuses)} 个分片有报告"
+            f"（缺：{missing}），对比只覆盖有报告的分片",
+            "",
+        ]
+    lines += [
+        "| 分片 | 本次 通过/可执行 | 基线 通过/可执行 | 失败变化 | 通过率变化 | 状态 |",
+        "|---|---|---|---|---|---|",
+    ]
+    lines.extend(_delta_row(delta) for delta in trend.shards)
+    lines.append("")
+    lines += _section(
+        "本轮新增失败",
+        _case_lines(trend.new_failures, with_duration=False),
+        empty="无（与基线相比没有新增失败用例）",
+    )
+    lines += _section(
+        "已修复", _case_lines(trend.fixed, with_duration=False), empty="无（基线里没有失败用例）"
+    )
+    return lines
+
+
+def render_markdown(
+    report: AggregateReport,
+    *,
+    slowest_limit: int = DEFAULT_SLOWEST_LIMIT,
+    baseline: AggregateReport | None = None,
+) -> str:
     """把聚合报告渲染成 Markdown（可直接追加进 ``$GITHUB_STEP_SUMMARY``）。
 
     Args:
-        report: 聚合报告。
+        report: 本轮聚合报告。
         slowest_limit: 「耗时最长的用例」小节展示条数。
+        baseline: 上一轮聚合报告；``None`` 或其中一份报告都没解析出来时
+            不渲染「与上一轮对比」小节（首次运行与缓存未命中都是这种情形）。
 
     Returns:
         以换行结尾的 Markdown 文本。
@@ -320,6 +659,7 @@ def render_markdown(report: AggregateReport, *, slowest_limit: int = DEFAULT_SLO
         f"| {report.skipped} | {report.pass_rate:.2%} | {report.duration:.3f}s |"
     )
     lines.append("")
+    lines += _comparison_section(build_aggregate_trend(report, baseline))
     lines += _section(
         "缺失或无法解析的报告",
         [f"- `{status.name}`：{status.reason}" for status in report.missing],
@@ -342,7 +682,8 @@ def build_parser() -> argparse.ArgumentParser:
     """构造命令行参数解析器（供 CI 与本地直接调用）。
 
     Returns:
-        配置好 ``--reports-dir`` / ``--shard`` / ``--output`` / ``--slowest`` 的解析器。
+        配置好 ``--reports-dir`` / ``--shard`` / ``--output`` / ``--slowest``
+        / ``--baseline-dir`` / ``--snapshot-dir`` 的解析器。
     """
     parser = argparse.ArgumentParser(
         prog="med-memory-aggregate",
@@ -373,18 +714,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SLOWEST_LIMIT,
         help=f"how many slow cases to list (default: {DEFAULT_SLOWEST_LIMIT})",
     )
+    parser.add_argument(
+        "--baseline-dir",
+        type=Path,
+        default=None,
+        help="directory holding the previous run's shard reports; enables the ledger comparison",
+    )
+    parser.add_argument(
+        "--snapshot-dir",
+        type=Path,
+        default=None,
+        help="copy this run's shard reports here so the next run can diff against them",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """命令行入口：读分片报告 → 渲染汇总 → 写文件或标准输出 → 返回整轮结论。
+    """命令行入口：读分片报告 → 渲染汇总 → 写文件或标准输出 → 快照本轮 → 返回整轮结论。
 
     Args:
         argv: 参数列表；``None`` 时读取 ``sys.argv[1:]``。
 
     Returns:
         见模块文档的退出码表。汇总 Markdown **先写后判**，因此即使退出码非 0，
-        ``--output`` 指定的文件也已就绪，供工作流的 ``if: always()`` 步骤贴进 Job Summary。
+        ``--output`` 指定的文件也已就绪，供工作流的 ``if: always()`` 步骤贴进 Job Summary；
+        ``--snapshot-dir`` 的快照同样在返回退出码之前完成，保证「报告缺失」这类
+        基础设施故障不会连带把基线链断掉。
     """
     args = build_parser().parse_args(argv)
     try:
@@ -393,12 +748,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
     report = build_aggregate(collect_shard_reports(args.reports_dir, names))
-    markdown = render_markdown(report, slowest_limit=args.slowest)
+    baseline = (
+        build_aggregate(collect_shard_reports(args.baseline_dir, names))
+        if args.baseline_dir is not None
+        else None
+    )
+    markdown = render_markdown(report, slowest_limit=args.slowest, baseline=baseline)
     if args.output is None:
         print(markdown, end="")
     else:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(markdown, encoding="utf-8")
+    if args.snapshot_dir is not None:
+        snapshot_reports(args.reports_dir, args.snapshot_dir, names)
     if not report.complete:
         return EXIT_INCOMPLETE
     return EXIT_FAILURES if report.has_failures else EXIT_OK

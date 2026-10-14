@@ -47,3 +47,6 @@ Thumbs.db
 
 # JUnit reports / trend summaries produced by the nightly integration workflow
 reports/
+
+# Rolling ledger baseline written by the aggregate job (and by --snapshot-dir locally)
+baseline/

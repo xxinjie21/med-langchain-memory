@@ -115,7 +115,7 @@ src/med_langchain_memory/
 ├── privacy/       # 字段级正则脱敏（手机号 / 身份证 / 病历号 / 床号）
 ├── runnable/      # 医疗增强 Runnable：租户隔离、Token 裁剪、LLM 摘要、并发锁、降级熔断
 ├── api/           # FastAPI 会话管理接口
-├── testing/       # 集成测试支撑：探针/开关、CI 前置守卫、分片计划、集群演练、JUnit 趋势与分片聚合（纯标准库）
+├── testing/       # 集成测试支撑：探针/开关、CI 前置守卫、分片计划、集群演练、JUnit 趋势、分片聚合与总账基线对比（纯标准库）
 ├── config.py      # 全局配置（pydantic-settings）
 └── exceptions.py  # 统一异常体系
 ```
@@ -364,6 +364,7 @@ python -m med_langchain_memory.testing.trend reports/redis/integration.xml --out
 |---|---|
 | 分片明细表 | 每个分片一行：用例数 / 通过 / 失败 / 跳过 / 通过率 / 耗时；缺报告的分片标 `⚠️ 无报告`，不伪造 0 数据 |
 | 合计行 | 只统计已解析的报告，通过率分母排除跳过用例 |
+| 与上一轮对比 | 整轮合计的**用例数 / 通过 / 失败 / 跳过 / 通过率 / 耗时**变化 + 逐分片状态表（`持平` / `✅ 改善` / `⚠️ 回退` / `新增` / `⚠️ 缺报告`）+ 跨分片的**本轮新增失败 / 已修复**清单 |
 | 缺失报告 | 逐片列出原因与期望路径（`reports/<分片>/integration.xml`） |
 | 失败用例 | 跨分片清单，带 `分片 · classname::name` 前缀，同名用例不会混淆 |
 | 最慢用例 | 跨分片排序的前 N 条（`--slowest`，默认 5） |
@@ -372,9 +373,23 @@ python -m med_langchain_memory.testing.trend reports/redis/integration.xml --out
 直接复用 `testing/trend.py`，不重复实现一遍 XML 解析：
 
 ```bash
+# 只看本轮总账
 python -m med_langchain_memory.testing.aggregate --reports-dir reports \
   --output reports/integration-aggregate.md
+
+# 与上一轮对比：--baseline-dir 指向上一轮的报告，--snapshot-dir 把本轮存给下一轮
+python -m med_langchain_memory.testing.aggregate --reports-dir reports \
+  --baseline-dir baseline --snapshot-dir baseline \
+  --output reports/integration-aggregate.md
 ```
+
+**总账基线怎么滚动**：`aggregate` 作业用 `actions/cache`（`path: baseline`，key 带
+`run_id`、`restore-keys` 前缀命中上一次）恢复上一轮的分片报告；聚合时 `--baseline-dir baseline`
+据此渲染对比小节，`--snapshot-dir baseline` 把本轮报告按规范布局
+`baseline/<分片>/integration.xml` 存一份，随缓存滚动给下一次运行。于是整轮对比
+**不需要任何外部存储**；首次运行（缓存未命中）时对比小节不出现，与单分片趋势
+「基线列显示 `—`」是同一套语义。基线本身不齐（上一轮有分片在 pytest 之前就挂了）时
+对比仍然可用，但会显式列出缺哪几片，避免把「少了一片」误读成「用例变少了」。
 
 | 退出码 | 含义 |
 |---|---|
@@ -385,6 +400,7 @@ python -m med_langchain_memory.testing.aggregate --reports-dir reports \
 
 无论退出码是多少，汇总 Markdown 都会**先写出来**：工作流里「聚合」与「贴摘要」是两步，
 后者带 `if: always()`，所以聚合失败时最需要看的那份总账反而不会丢。
+`--snapshot-dir` 的快照同样在返回退出码之前完成，一次基础设施故障不会把基线链断掉。
 
 报告目录两种布局都认：本地跑出来的 `reports/<分片>/integration.xml`，以及
 `actions/download-artifact` 解出来的 `reports/integration-report-<分片>/integration.xml`
@@ -475,7 +491,7 @@ python -m med_langchain_memory.release --dist dist --expected-version v0.1.0   #
 
 ## 每日迭代节奏
 
-项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行）。
+项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行、D44 分片结果聚合汇总作业、D45 汇总总账与上一轮基线对比）。
 
 ---
 

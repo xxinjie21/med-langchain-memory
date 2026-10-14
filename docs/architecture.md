@@ -73,7 +73,7 @@ LLM 本身无状态，对话的「记忆」必须由外部存储承担。本库�
 │  ├─ trend.py     JUnit 报告汇总 + 趋势对比 + Markdown 渲染             │
 │  ├─ preflight.py 必需服务前置守卫：不可达即失败（防「集体跳过」假绿灯）│
 │  ├─ shards.py    集成套件按服务分片：用例路径/服务/compose 名/环境变量的单一真值源│
-│  └─ aggregate.py 分片结果聚合：四片报告合成一份总账 + 整轮唯一的结论退出码  │
+│  └─ aggregate.py 分片结果聚合：四片合成总账 + 与上一轮基线对比 + 结论退出码 │
 ├──────────────────────────────────────────────────────────────────────┤
 │  serde/          序列化层：Serializer 抽象 + ProtobufSerializer          │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -448,6 +448,39 @@ Job Summary 里总账与四份分片摘要并存，需要一点阅读顺序上�
 
 ---
 
+### ADR-17 · 总账自带「与上一轮对比」，基线靠滚动缓存而不是外部存储
+
+**决策**：在 ADR-16 的总账之上再加一层对比——`testing/aggregate.py` 的
+`AggregateTrend` / `build_aggregate_trend` 拿上一轮的分片报告算出**整轮合计的变化**
+（用例数 / 通过 / 失败 / 跳过 / 通过率 / 耗时）、**逐分片变化**（失败数、通过率与状态标记）
+以及跨分片的**新增失败 / 已修复**清单；`render_markdown(..., baseline=...)` 把它渲染成
+「与上一轮对比」小节。基线的取得方式是 `--snapshot-dir`（把本轮报告按规范布局写进
+`baseline/<分片>/integration.xml`）+ `actions/cache` 滚动（`path: baseline`，
+key 带 `run_id`、`restore-keys` 前缀命中上一次），由汇总作业自己完成闭环。
+
+| 关注点 | 实现 | 为什么这样切 |
+|---|---|---|
+| 对比粒度 | 整轮合计 + 逐分片 + 跨分片用例清单 | D41 的趋势对比只到「单分片 vs 该分片上一次」，要回答「整轮比昨晚好了还是差了、是哪一片退化的」得自己拼四份摘要 |
+| 基线来源 | `--snapshot-dir` 写、`actions/cache` 传、`--baseline-dir` 读 | 不引入任何外部存储（对象存储 / DB / artifact 追溯），复用 D41 已经验证过的滚动缓存模式 |
+| 基线布局 | 快照**只按规范布局**写出 `baseline/<分片>/integration.xml` | 基线目录只有一种结构，读取方不必再猜布局（读入侧仍兼容两种） |
+| 基线不齐 | 对比照常，`baseline_complete` 为假并在小节里列出缺哪几片 | 上一轮有分片在 pytest 之前挂掉时，把「少了一片」误读成「用例变少了」是最危险的错 |
+| 无基线 | `baseline=None` / 基线一份报告都没解析出来 → 不渲染对比小节 | 首次运行与缓存未命中都是这种情形，输出与 D44 逐字一致（纯增量，不改既有契约） |
+| 快照时机 | 与写 Markdown 一样，在返回退出码**之前** | 一次基础设施故障不该把基线链断掉，下一轮仍能拿到上一轮的报告 |
+
+**理由**：
+
+* 总账回答的是「今晚绿没绿」，而人真正要的是「比昨晚好了还是差了」——两句话的成本
+  几乎相同（都是读同一批 JUnit），但后者才能驱动行动（谁引入了回退、哪一片在退化）；
+* 对比是**纯计数**：分片名参与比对（同名用例出现在不同分片不算「已修复」），
+  因此完全离线可测，不需要任何中间件；
+* 「基线不齐」必须显式：整轮对比的分母一旦悄悄少一片，结论就会反向。
+
+**代价**：汇总作业多一个缓存步骤与一次快照写盘；对比小节让总账更长一点
+（因此 `--slowest` 之类的可裁剪项保留）。本地跑 `--snapshot-dir` 会在仓库根建
+`baseline/`，已加入 `.gitignore`。
+
+---
+
 ## 5. 并发与可用性
 
 | 机制 | 实现 | 降级路径 |
@@ -504,6 +537,7 @@ Job Summary 里总账与四份分片摘要并存，需要一点阅读顺序上�
 | 假绿灯防护 | `testing/preflight.py` 按 `MED_MEMORY_IT_REQUIRED` 逐个探针，任一必需服务不可用即退出码 1——否则「用例集体 skip」会让环境故障伪装成通过；离线单测在 `tests/test_integration/test_preflight.py` |
 | 夜间趋势上报 | `testing/trend.py` 解析 JUnit 报告渲染 Markdown 摘要写入 Job Summary，报告经 `actions/cache` **按分片**滚动为下次基线；离线单测在 `tests/test_integration/test_trend.py` |
 | 分片结果聚合 | `testing/aggregate.py` 把四个分片的报告聚合成一份总账（分片明细 + 合计 + 缺失报告 + 失败用例 + 最慢用例）写入 Job Summary，并以退出码 `0/1/2/3` 区分「齐备无失败 / 缺报告 / 有失败 / 参数非法」；离线单测在 `tests/test_integration/test_aggregate.py` |
+| 总账基线对比 | 同一模块的 `AggregateTrend` / `build_aggregate_trend` 拿 `--baseline-dir` 的上一轮报告算出整轮合计变化、逐分片状态与跨分片的新增失败 / 已修复；`--snapshot-dir` 把本轮报告写进 `baseline/` 由 `actions/cache` 滚动给下一轮；无基线时该小节整体消失（纯增量）；离线单测同上，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestAggregateBaseline` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |

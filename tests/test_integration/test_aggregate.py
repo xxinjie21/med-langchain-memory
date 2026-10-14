@@ -1,4 +1,4 @@
-"""``med_langchain_memory.testing.aggregate`` 的离线单测（D44 分片结果聚合）。
+"""``med_langchain_memory.testing.aggregate`` 的离线单测（D44 聚合 + D45 总账基线对比）。
 
 全部用例只依赖标准库与合成 JUnit XML，**不需要任何真实中间件、Docker 或网络**，
 因此这些用例在默认 ``pytest`` 下就会执行（不带 ``integration`` 标记）。
@@ -17,18 +17,23 @@ from med_langchain_memory.exceptions import ValidationError
 from med_langchain_memory.testing.aggregate import (
     AGGREGATE_SUMMARY_NAME,
     ARTIFACT_PREFIX,
+    BASELINE_LEDGER_DIR,
     EXIT_FAILURES,
     EXIT_INCOMPLETE,
     EXIT_OK,
     EXIT_USAGE,
     AggregateReport,
+    AggregateTrend,
+    ShardDelta,
     ShardStatus,
     build_aggregate,
+    build_aggregate_trend,
     build_parser,
     collect_shard_reports,
     main,
     render_markdown,
     shard_report_path,
+    snapshot_reports,
 )
 from med_langchain_memory.testing.shards import shard_names
 from med_langchain_memory.testing.trend import JUNIT_REPORT_NAME, parse_junit_xml
@@ -482,3 +487,510 @@ class TestModuleEntryPoint:
         )
         assert result.returncode == expected, result.stderr
         assert "# 集成测试分片聚合" in result.stdout
+
+
+def aggregate_of(spec: dict[str, list[tuple[str, str]]]) -> AggregateReport:
+    """按 ``{分片名: [(用例名, kind)]}`` 构造聚合报告（``kind`` 为空串表示通过）。"""
+    return build_aggregate([make_status(name, cases) for name, cases in spec.items()])
+
+
+def reports_of(root: Path, spec: dict[str, list[str]]) -> Path:
+    """把 ``{分片名: [<testcase> 片段]}`` 写进 ``root``，返回 ``root``。"""
+    for name, cases in spec.items():
+        write_report(root, name, cases)
+    return root
+
+
+class TestSnapshotReports:
+    """本轮报告快照：把报告按规范布局存一份，供下一轮当基线。"""
+
+    def test_copies_direct_layout_into_the_canonical_target(self, tmp_path: Path) -> None:
+        """正向：``reports/<分片>/integration.xml`` 被复制到 ``baseline/<分片>/integration.xml``。"""
+        source = write_report(tmp_path / "reports", "redis", [passing_case("redis")])
+        target = tmp_path / BASELINE_LEDGER_DIR
+        written = snapshot_reports(tmp_path / "reports", target, ["redis"])
+        assert written == (target / "redis" / JUNIT_REPORT_NAME,)
+        assert written[0].read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+
+    def test_normalises_the_artifact_layout_too(self, tmp_path: Path) -> None:
+        """正向：artifact 下载布局也能被规范成 ``baseline/<分片>/``（基线只有一种结构）。"""
+        write_report(tmp_path / "reports", "mysql", [passing_case("mysql")], layout="artifact")
+        target = tmp_path / BASELINE_LEDGER_DIR
+        written = snapshot_reports(tmp_path / "reports", target, ["mysql"])
+        assert written == (target / "mysql" / JUNIT_REPORT_NAME,)
+        assert not (target / f"{ARTIFACT_PREFIX}mysql").exists()
+
+    def test_written_paths_follow_the_shard_table_order(self, all_green_reports: Path) -> None:
+        """正向：返回路径按分片表顺序排列（与聚合口径同源）。"""
+        target = all_green_reports.parent / BASELINE_LEDGER_DIR
+        written = snapshot_reports(all_green_reports, target)
+        assert tuple(path.parent.name for path in written) == shard_names()
+
+    def test_missing_shards_are_skipped(self, tmp_path: Path) -> None:
+        """边界：本轮缺报告的分片不写快照（基线里保持缺，才能被对比显式标出）。"""
+        write_report(tmp_path / "reports", "redis", [passing_case("redis")])
+        written = snapshot_reports(tmp_path / "reports", tmp_path / BASELINE_LEDGER_DIR)
+        assert tuple(path.parent.name for path in written) == ("redis",)
+        assert not (tmp_path / BASELINE_LEDGER_DIR / "mysql").exists()
+
+    def test_unknown_shard_is_rejected(self, tmp_path: Path) -> None:
+        """异常：未知分片名必须报错，而不是静默少存一片。"""
+        with pytest.raises(ValidationError):
+            snapshot_reports(tmp_path, tmp_path / BASELINE_LEDGER_DIR, ["mongo"])
+
+    def test_partial_selection_snapshots_only_the_selected_shard(self, tmp_path: Path) -> None:
+        """正向：``--shard`` 语义下只快照被选中的分片。"""
+        for name in ("redis", "mysql"):
+            write_report(tmp_path / "reports", name, [passing_case(name)])
+        written = snapshot_reports(tmp_path / "reports", tmp_path / BASELINE_LEDGER_DIR, ["redis"])
+        assert tuple(path.parent.name for path in written) == ("redis",)
+
+    def test_skips_when_the_source_is_the_target(self, tmp_path: Path) -> None:
+        """边界：源与目标同一路径时不做自拷贝（``copyfile`` 会因同文件报错）。"""
+        write_report(tmp_path, "redis", [passing_case("redis")])
+        assert snapshot_reports(tmp_path, tmp_path, ["redis"]) == ()
+        assert collect_shard_reports(tmp_path, ["redis"])[0].present
+
+    def test_snapshot_round_trips_into_a_readable_baseline(self, all_green_reports: Path) -> None:
+        """正向：快照出来的目录能被 ``--baseline-dir`` 那一侧原样读回（工作流的实际契约）。"""
+        target = all_green_reports.parent / BASELINE_LEDGER_DIR
+        snapshot_reports(all_green_reports, target)
+        statuses = collect_shard_reports(target)
+        assert all(status.present for status in statuses)
+        assert tuple(status.name for status in statuses) == shard_names()
+
+
+class TestShardDelta:
+    """逐分片差异：状态判定与三项变化量。"""
+
+    def test_unchanged_when_both_sides_match(self) -> None:
+        """正向：两侧一致时为「持平」，变化量都是 0。"""
+        delta = ShardDelta(
+            name="redis",
+            title="Redis single node",
+            current=parse_junit_xml(make_junit([passing_case("redis")])),
+            baseline=parse_junit_xml(make_junit([passing_case("redis")])),
+        )
+        assert delta.comparable
+        assert delta.state == "unchanged"
+        assert (delta.failed_delta, delta.total_delta, delta.pass_rate_delta) == (0, 0, 0.0)
+
+    def test_regressed_when_failures_grow(self) -> None:
+        """正向：失败用例变多即「回退」。"""
+        delta = ShardDelta(
+            name="mysql",
+            title="MySQL",
+            current=parse_junit_xml(
+                make_junit(
+                    [passing_case("mysql"), make_case("tests.test_integration", "x", kind="error")]
+                )
+            ),
+            baseline=parse_junit_xml(make_junit([passing_case("mysql")])),
+        )
+        assert delta.state == "regressed"
+        assert delta.failed_delta == 1
+        assert delta.total_delta == 1
+
+    def test_improved_when_failures_shrink(self) -> None:
+        """正向：失败用例变少即「改善」。"""
+        delta = ShardDelta(
+            name="redis",
+            title="Redis",
+            current=parse_junit_xml(make_junit([passing_case("redis")])),
+            baseline=parse_junit_xml(
+                make_junit(
+                    [
+                        passing_case("redis"),
+                        make_case("tests.test_integration", "x", kind="failure"),
+                    ]
+                )
+            ),
+        )
+        assert delta.state == "improved"
+        assert delta.failed_delta == -1
+        assert delta.pass_rate_delta > 0
+
+    def test_regressed_when_failures_flat_but_pass_rate_drops(self) -> None:
+        """边界：失败数不变、通过率下降（少了一条通过用例）也算回退。"""
+        delta = ShardDelta(
+            name="redis",
+            title="Redis",
+            current=parse_junit_xml(
+                make_junit(
+                    [
+                        make_case("tests.test_integration", "a"),
+                        make_case("tests.test_integration", "b", kind="failure"),
+                    ]
+                )
+            ),
+            baseline=parse_junit_xml(
+                make_junit(
+                    [
+                        make_case("tests.test_integration", "a"),
+                        make_case("tests.test_integration", "b"),
+                        make_case("tests.test_integration", "c", kind="failure"),
+                    ]
+                )
+            ),
+        )
+        assert delta.failed_delta == 0
+        assert delta.state == "regressed"
+        assert delta.pass_rate_delta < 0
+
+    def test_added_when_only_the_current_run_has_a_report(self) -> None:
+        """边界：基线没有该分片（上一轮它没跑出报告）时标记为「新增」。"""
+        delta = ShardDelta(
+            name="mysql",
+            title="MySQL",
+            current=parse_junit_xml(make_junit([passing_case("mysql")])),
+        )
+        assert not delta.comparable
+        assert delta.state == "added"
+        assert delta.failed_delta is None
+
+    def test_removed_when_only_the_baseline_has_a_report(self) -> None:
+        """边界：本轮缺该分片报告时标记为「缺报告」，不当作「用例归零」。"""
+        delta = ShardDelta(
+            name="elasticsearch",
+            title="Elasticsearch",
+            baseline=parse_junit_xml(make_junit([passing_case("elasticsearch")])),
+        )
+        assert not delta.comparable
+        assert delta.state == "removed"
+        assert delta.total_delta is None
+
+    def test_absent_when_neither_side_has_a_report(self) -> None:
+        """边界：两侧都没有报告时状态为「—」，三项变化量都是 ``None``。"""
+        delta = ShardDelta(name="redis", title="Redis")
+        assert delta.state == "absent"
+        assert (delta.failed_delta, delta.total_delta, delta.pass_rate_delta) == (None, None, None)
+
+
+class TestAggregateTrend:
+    """整轮总账对比：可用性判定、逐分片差异、跨分片新增失败 / 已修复与合计变化量。"""
+
+    def test_without_a_baseline_every_comparison_degrades_to_empty(self) -> None:
+        """边界：首次运行（无基线）时不报错，所有对比项退化为空 / ``None``。"""
+        trend = build_aggregate_trend(aggregate_of({"redis": [("a", "")]}))
+        assert isinstance(trend, AggregateTrend)
+        assert not trend.available
+        assert not trend.baseline_complete
+        assert trend.shards == ()
+        assert (trend.new_failures, trend.fixed) == ((), ())
+        assert (trend.total_delta, trend.failed_delta, trend.pass_rate_delta) == (None, None, None)
+        assert trend.duration_delta is None
+
+    def test_baseline_without_any_report_is_not_available(self, tmp_path: Path) -> None:
+        """边界：``--baseline-dir`` 指向空目录（缓存未命中）时同样退化为无基线。"""
+        empty = build_aggregate(collect_shard_reports(tmp_path / "nope"))
+        trend = build_aggregate_trend(aggregate_of({"redis": [("a", "")]}), empty)
+        assert not trend.available
+        assert trend.shards == ()
+        assert trend.total_delta is None
+
+    def test_partial_baseline_is_available_but_not_complete(self, tmp_path: Path) -> None:
+        """边界：基线只覆盖部分分片时对比仍可用，但必须显式标出「不齐」。
+
+        真实场景是「上一轮有分片在 pytest 之前就挂了」：基线目录里只有 redis 的报告，
+        而期望的分片清单仍是完整的四片。
+        """
+        reports = all_green_reports_of(tmp_path)
+        write_report(tmp_path / "old", "redis", [passing_case("redis")])
+        baseline = build_aggregate(collect_shard_reports(tmp_path / "old"))
+        trend = build_aggregate_trend(build_aggregate(collect_shard_reports(reports)), baseline)
+        assert trend.available
+        assert not trend.baseline_complete
+        assert tuple(delta.name for delta in trend.shards) == shard_names()
+        assert {delta.state for delta in trend.shards if delta.baseline is None} == {"added"}
+
+    def test_shards_cover_the_shard_table_order(self, all_green_reports: Path) -> None:
+        """正向：逐分片差异与分片表同序，且两侧报告都被带上。"""
+        baseline = build_aggregate(collect_shard_reports(all_green_reports))
+        trend = build_aggregate_trend(
+            build_aggregate(collect_shard_reports(all_green_reports)), baseline
+        )
+        assert tuple(delta.name for delta in trend.shards) == shard_names()
+        assert all(delta.comparable for delta in trend.shards)
+        assert trend.baseline_complete
+
+    def test_aggregate_level_deltas_are_signed(self) -> None:
+        """正向：整轮合计的变化量按「本轮 - 基线」给出。"""
+        current = aggregate_of({"redis": [("a", ""), ("b", "")], "mysql": [("c", "")]})
+        baseline = aggregate_of(
+            {"redis": [("a", ""), ("b", "failure")], "mysql": [("c", "skipped")]}
+        )
+        trend = build_aggregate_trend(current, baseline)
+        assert trend.total_delta == 0
+        assert trend.failed_delta == -1
+        assert trend.pass_rate_delta > 0
+
+    def test_duration_delta_is_rounded_to_milliseconds(self) -> None:
+        """边界：耗时变化保留 3 位小数（浮点减法后不留长尾）。"""
+        current = build_aggregate(
+            [make_status("redis", [("a", "")])],
+        )
+        baseline = build_aggregate(
+            [make_status("redis", [("a", "")])],
+        )
+        # 直接改耗时：make_status 默认 0.100s，这里显式构造一份 0.300s 的报告。
+        slower = build_aggregate(
+            [
+                ShardStatus(
+                    name="redis",
+                    title="Redis single node",
+                    path=Path("redis") / JUNIT_REPORT_NAME,
+                    report=parse_junit_xml(
+                        make_junit([make_case("tests.test_integration", "a", time="0.300")])
+                    ),
+                )
+            ]
+        )
+        assert build_aggregate_trend(current, baseline).duration_delta == 0.0
+        assert build_aggregate_trend(slower, baseline).duration_delta == 0.2
+
+    def test_new_failures_are_scoped_by_shard(self) -> None:
+        """正向：同名用例出现在不同分片时不算「已修复 / 新增」（分片名参与比对）。"""
+        current = aggregate_of({"redis": [("test_x", "")], "mysql": [("test_x", "failure")]})
+        baseline = aggregate_of({"redis": [("test_x", "failure")], "mysql": [("test_x", "")]})
+        trend = build_aggregate_trend(current, baseline)
+        assert [(shard, case.name) for shard, case in trend.new_failures] == [("mysql", "test_x")]
+        assert [(shard, case.name) for shard, case in trend.fixed] == [("redis", "test_x")]
+
+    def test_new_failures_and_fixed_are_empty_for_identical_runs(self) -> None:
+        """边界：两轮完全相同时两个清单都为空。"""
+        report = aggregate_of({"redis": [("a", ""), ("b", "failure")]})
+        trend = build_aggregate_trend(report, report)
+        assert trend.new_failures == ()
+        assert trend.fixed == ()
+
+
+class TestComparisonRendering:
+    """对比小节的渲染：指标表、逐分片状态表、新增失败 / 已修复清单与基线不齐警告。"""
+
+    def test_section_is_absent_without_a_baseline(self, all_green_reports: Path) -> None:
+        """边界：无基线时不出现对比小节（首次运行的输出与 D44 保持一致）。"""
+        markdown = render_markdown(build_aggregate(collect_shard_reports(all_green_reports)))
+        assert "与上一轮对比" not in markdown
+
+    def test_section_renders_metric_table_with_signed_deltas(self) -> None:
+        """正向：指标表给出本次 / 基线 / 变化三列，变化带符号。"""
+        current = aggregate_of({"redis": [("a", ""), ("b", "")]})
+        baseline = aggregate_of({"redis": [("a", ""), ("b", "failure")]})
+        markdown = render_markdown(current, baseline=baseline)
+        assert "### 与上一轮对比" in markdown
+        assert "| 用例总数 | 2 | 2 | +0 |" in markdown
+        assert "| 通过 | 2 | 1 | +1 |" in markdown
+        assert "| 失败/错误 | 0 | 1 | -1 |" in markdown
+        assert "| 总耗时 | 0.200s | 0.200s | +0.000s |" in markdown
+        assert "基线报告齐备（1/1 个分片），通过率变化 **+50.00%**" in markdown
+
+    def test_shard_delta_table_marks_regressions(self) -> None:
+        """正向：逐分片状态表标出回退（含失败变化与通过率变化）。"""
+        current = aggregate_of({"redis": [("a", "failure")]})
+        baseline = aggregate_of({"redis": [("a", "")]})
+        markdown = render_markdown(current, baseline=baseline)
+        assert "| `redis` | 0/1 | 1/1 | +1 | -100.00% | ⚠️ 回退 |" in markdown
+
+    def test_shard_delta_table_marks_added_shards(self, tmp_path: Path) -> None:
+        """边界：基线缺某片时该行变化列留空并标「新增」，不伪造 0 数据。"""
+        reports = all_green_reports_of(tmp_path)
+        write_report(tmp_path / "old", "redis", [passing_case("redis")])
+        current = build_aggregate(collect_shard_reports(reports))
+        baseline = build_aggregate(collect_shard_reports(tmp_path / "old"))
+        markdown = render_markdown(current, baseline=baseline)
+        assert "| `mysql` | 1/1 | — | — | — | 新增 |" in markdown
+        assert "⚠️ 基线只有 1/4 个分片有报告（缺：mysql, elasticsearch, redis-cluster）" in markdown
+
+    def test_new_failures_and_fixed_are_listed_with_shard_prefix(self) -> None:
+        """正向：新增失败与已修复都带分片前缀，可直接定位到后端。"""
+        current = aggregate_of({"redis": [("a", "")], "mysql": [("b", "failure")]})
+        baseline = aggregate_of({"redis": [("a", "failure")], "mysql": [("b", "")]})
+        markdown = render_markdown(current, baseline=baseline)
+        assert "### 本轮新增失败" in markdown
+        assert "- `mysql` · `tests.test_integration.test_mysql::b`" in markdown
+        assert "### 已修复" in markdown
+        assert "- `redis` · `tests.test_integration.test_redis::a`" in markdown
+
+    def test_placeholders_when_nothing_changed(self) -> None:
+        """边界：无新增失败、无已修复时两个小节都给出占位句。"""
+        report = aggregate_of({"redis": [("a", "")]})
+        markdown = render_markdown(report, baseline=report)
+        assert "无（与基线相比没有新增失败用例）" in markdown
+        assert "无（基线里没有失败用例）" in markdown
+
+    def test_existing_sections_and_newline_contract_are_preserved(self) -> None:
+        """边界：加了对比小节后，原有小节与「单个换行结尾」的契约不变。"""
+        report = aggregate_of({"redis": [("a", "")]})
+        markdown = render_markdown(report, baseline=report)
+        assert markdown.startswith("# 集成测试分片聚合")
+        assert "| **合计** | 1 | 1 | 0 | 0 | 100.00% | 0.100s |" in markdown
+        assert "### 缺失或无法解析的报告" in markdown
+        assert "### 失败用例" in markdown
+        assert "### 耗时最长的用例" in markdown
+        assert markdown.endswith("\n") and not markdown.endswith("\n\n")
+
+
+def all_green_reports_of(root: Path) -> Path:
+    """在 ``root`` 下造一份「四个分片各一条通过用例」的报告目录。"""
+    reports = root / "reports"
+    for name in shard_names():
+        write_report(reports, name, [passing_case(name)])
+    return reports
+
+
+class TestBaselineCli:
+    """命令行入口：基线目录、快照目录与两者的组合行为。"""
+
+    def test_parser_defaults_disable_baseline_and_snapshot(self) -> None:
+        """正向：默认不带基线与快照（保持 D44 的默认行为不变）。"""
+        args = build_parser().parse_args([])
+        assert args.baseline_dir is None
+        assert args.snapshot_dir is None
+
+    def test_baseline_dir_enables_the_comparison(
+        self, all_green_reports: Path, tmp_path: Path
+    ) -> None:
+        """正向：给了 ``--baseline-dir`` 且目录里有报告时输出对比小节。"""
+        output = tmp_path / AGGREGATE_SUMMARY_NAME
+        code = main(
+            [
+                "--reports-dir",
+                str(all_green_reports),
+                "--baseline-dir",
+                str(all_green_reports),
+                "--output",
+                str(output),
+            ]
+        )
+        assert code == EXIT_OK
+        assert "### 与上一轮对比" in output.read_text(encoding="utf-8")
+
+    def test_absent_baseline_dir_renders_no_comparison(
+        self, all_green_reports: Path, tmp_path: Path
+    ) -> None:
+        """边界：基线目录不存在（缓存未命中）时静默退化为无对比，退出码不受影响。"""
+        code = main(
+            [
+                "--reports-dir",
+                str(all_green_reports),
+                "--baseline-dir",
+                str(tmp_path / "nope"),
+                "--slowest",
+                "0",
+            ]
+        )
+        assert code == EXIT_OK
+
+    def test_absent_baseline_dir_prints_no_section(
+        self, all_green_reports: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """边界：同上，标准输出里也确实没有对比小节。"""
+        assert (
+            main(
+                ["--reports-dir", str(all_green_reports), "--baseline-dir", str(tmp_path / "nope")]
+            )
+            == EXIT_OK
+        )
+        assert "与上一轮对比" not in capsys.readouterr().out
+
+    def test_snapshot_dir_writes_the_canonical_baseline(
+        self, all_green_reports: Path, tmp_path: Path
+    ) -> None:
+        """正向：``--snapshot-dir`` 把四个分片的报告写进 ``baseline/<分片>/``。"""
+        target = tmp_path / BASELINE_LEDGER_DIR
+        code = main(
+            [
+                "--reports-dir",
+                str(all_green_reports),
+                "--snapshot-dir",
+                str(target),
+                "--slowest",
+                "0",
+            ]
+        )
+        assert code == EXIT_OK
+        for name in shard_names():
+            assert (target / name / JUNIT_REPORT_NAME).is_file()
+
+    def test_snapshot_is_written_even_when_reports_are_missing(self, tmp_path: Path) -> None:
+        """边界：本轮缺报告（退出码 1）时快照仍要写，否则基线链会被一次基础设施故障断掉。"""
+        write_report(tmp_path / "reports", "redis", [passing_case("redis")])
+        target = tmp_path / BASELINE_LEDGER_DIR
+        code = main(["--reports-dir", str(tmp_path / "reports"), "--snapshot-dir", str(target)])
+        assert code == EXIT_INCOMPLETE
+        assert (target / "redis" / JUNIT_REPORT_NAME).is_file()
+
+    def test_snapshot_then_baseline_round_trip(
+        self, all_green_reports: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """正向：先快照再拿它当基线，两轮相同 → 对比小节全为 0 变化。"""
+        target = tmp_path / BASELINE_LEDGER_DIR
+        assert (
+            main(["--reports-dir", str(all_green_reports), "--snapshot-dir", str(target)])
+            == EXIT_OK
+        )
+        assert (
+            main(
+                [
+                    "--reports-dir",
+                    str(all_green_reports),
+                    "--baseline-dir",
+                    str(target),
+                    "--slowest",
+                    "0",
+                ]
+            )
+            == EXIT_OK
+        )
+        out = capsys.readouterr().out
+        assert "基线报告齐备（4/4 个分片），通过率变化 **+0.00%**" in out
+        assert "无（与基线相比没有新增失败用例）" in out
+
+    def test_shard_selection_applies_to_the_baseline(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """正向：``--shard`` 同时约束本轮与基线的分片集合（只比这一片）。"""
+        reports = all_green_reports_of(tmp_path)
+        baseline = tmp_path / BASELINE_LEDGER_DIR
+        for name in ("redis", "mysql"):
+            write_report(baseline, name, [passing_case(name)])
+        code = main(
+            [
+                "--reports-dir",
+                str(reports),
+                "--baseline-dir",
+                str(baseline),
+                "--shard",
+                "redis",
+                "--slowest",
+                "0",
+            ]
+        )
+        assert code == EXIT_OK
+        assert "基线报告齐备（1/1 个分片）" in capsys.readouterr().out
+
+    def test_module_entry_point_accepts_baseline_and_snapshot(self, tmp_path: Path) -> None:
+        """正向：真跑 ``python -m`` 时两个新选项都存在（argparse 不认会退成 2）。"""
+        reports = all_green_reports_of(tmp_path)
+        baseline = tmp_path / BASELINE_LEDGER_DIR
+        env = {**os.environ, "PYTHONPATH": str(PROJECT_ROOT / "src")}
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                AGGREGATE_MODULE,
+                "--reports-dir",
+                str(reports),
+                "--baseline-dir",
+                str(baseline),
+                "--snapshot-dir",
+                str(baseline),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=PROJECT_ROOT,
+            check=False,
+        )
+        assert result.returncode == EXIT_OK, result.stderr
+        assert (baseline / "redis" / JUNIT_REPORT_NAME).is_file()
