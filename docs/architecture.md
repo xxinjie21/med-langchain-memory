@@ -381,11 +381,11 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 
 ### ADR-15 · 集成套件按服务分片并行，分片表是「单一真值来源」
 
-**决策**：把真机套件按服务切成四个**互不依赖**的分片
-（`redis` / `mysql` / `elasticsearch` / `redis-cluster`），
-`integration.yml` 用 `strategy.matrix.shard` 并行执行；每个分片在自己的 runner 上
+**决策**：把真机套件按服务切成五个**互不依赖**的分片
+（`redis` / `mysql` / `elasticsearch` / `redis-cluster` / `redis-cluster-failover`），
+`integration.yml` 用 `strategy.matrix` 并行执行；每个分片在自己的 runner 上
 **只拉起自己需要的容器**。分片表（用例路径 / 必需服务 / compose 服务名 /
-初始化容器 / 环境变量）全部由纯标准库模块
+初始化容器 / 环境变量 / 墙钟预算）全部由纯标准库模块
 `med_langchain_memory.testing.shards` 给出，工作流只调用它的 CLI：
 
 | 关注点 | 实现 | 为什么这样切 |
@@ -396,7 +396,7 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 | 拉起容器 | `--format compose` → `docker compose up -d --wait <服务>` | 只起本分片需要的服务，冷启动时间不叠加 |
 | 一次性初始化 | `--format init` → `run --rm <容器>` | 集群分片才需要；非集群分片拿到空串即整步跳过，工作流无需 `if:` 判断分片名 |
 | 服务地址 | `--format env`（复用 `services.resolve_service`） | 工作流里**不出现任何 `MED_MEMORY_IT_*_URL` 字面量** |
-| 失败语义 | `fail-fast: false` | 一个分片红不代表其它分片没有价值，四个分片各自出结论 |
+| 失败语义 | `fail-fast: false` | 一个分片红不代表其它分片没有价值，五个分片各自出结论 |
 
 **理由**：
 
@@ -413,14 +413,14 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
   分片要的 compose 服务名必须在编排文件里存在）。
 
 **代价**：每个分片重复一遍 checkout / setup-python / pip install（矩阵作业的固有开销）；
-报告、缓存与 artifact 都按分片隔离，Job Summary 从一份变成四份。
+报告、缓存与 artifact 都按分片隔离，Job Summary 从一份变成五份。
 
 ---
 
-### ADR-16 · 分片结果用一个汇总作业聚合成总账，而不是让人点开四个作业
+### ADR-16 · 分片结果用一个汇总作业聚合成总账，而不是让人点开五个作业
 
 **决策**：在矩阵作业之后追加 `aggregate` 作业（`needs: integration` + `if: always()`），
-把四个分片的 JUnit 报告聚合成一份 Markdown 总账写进 Job Summary，
+把五个分片的 JUnit 报告聚合成一份 Markdown 总账写进 Job Summary，
 并用**单一退出码**给出整轮集成测试的结论。聚合逻辑放在纯标准库模块
 `med_langchain_memory.testing.aggregate`：
 
@@ -435,8 +435,8 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
 
 **理由**：
 
-* 分片并行把墙钟时间压到「最慢的那一片」，代价是结论被切成四份；
-  人要知道「今晚到底绿没绿」得点开四个作业，反而比串行更贵——聚合把这份成本收回来；
+* 分片并行把墙钟时间压到「最慢的那一片」，代价是结论被切成五份；
+  人要知道「今晚到底绿没绿」得点开五个作业，反而比串行更贵——聚合把这份成本收回来；
 * 「缺报告」在单分片视角里不可见（没报告就是没跑过），但在总账里它是
   **CI 基础设施故障**的明确信号：矩阵作业在 pytest 之前挂掉（compose 起不来、
   守卫失败）时不会有 JUnit 文件，聚合据此给出退出码 `1`，而不是安静地少算一片；
@@ -444,7 +444,7 @@ Docker Desktop（Windows / macOS）上容器 IP 与子网网关都不可从宿�
   不引入任何新的中间件依赖。
 
 **代价**：多一个作业（多一次 checkout / setup-python / 下载 artifact 的开销）；
-Job Summary 里总账与四份分片摘要并存，需要一点阅读顺序上的约定（总账在最后）。
+Job Summary 里总账与五份分片摘要并存，需要一点阅读顺序上的约定（总账在最后）。
 
 ---
 
@@ -460,7 +460,7 @@ key 带 `run_id`、`restore-keys` 前缀命中上一次），由汇总作业自�
 
 | 关注点 | 实现 | 为什么这样切 |
 |---|---|---|
-| 对比粒度 | 整轮合计 + 逐分片 + 跨分片用例清单 | D41 的趋势对比只到「单分片 vs 该分片上一次」，要回答「整轮比昨晚好了还是差了、是哪一片退化的」得自己拼四份摘要 |
+| 对比粒度 | 整轮合计 + 逐分片 + 跨分片用例清单 | D41 的趋势对比只到「单分片 vs 该分片上一次」，要回答「整轮比昨晚好了还是差了、是哪一片退化的」得自己拼五份摘要 |
 | 基线来源 | `--snapshot-dir` 写、`actions/cache` 传、`--baseline-dir` 读 | 不引入任何外部存储（对象存储 / DB / artifact 追溯），复用 D41 已经验证过的滚动缓存模式 |
 | 基线布局 | 快照**只按规范布局**写出 `baseline/<分片>/integration.xml` | 基线目录只有一种结构，读取方不必再猜布局（读入侧仍兼容两种） |
 | 基线不齐 | 对比照常，`baseline_complete` 为假并在小节里列出缺哪几片 | 上一轮有分片在 pytest 之前挂掉时，把「少了一片」误读成「用例变少了」是最危险的错 |
@@ -478,6 +478,35 @@ key 带 `run_id`、`restore-keys` 前缀命中上一次），由汇总作业自�
 **代价**：汇总作业多一个缓存步骤与一次快照写盘；对比小节让总账更长一点
 （因此 `--slowest` 之类的可裁剪项保留）。本地跑 `--snapshot-dir` 会在仓库根建
 `baseline/`，已加入 `.gitignore`。
+
+---
+
+### ADR-18 · 破坏性演练独立成片，矩阵取值与超时预算由 `plan` 作业生成
+
+**决策**：在 ADR-15 的五分片之上再做两件事——① 把停主节点的故障转移演练从
+`redis-cluster` 分片拆成独立的 `redis-cluster-failover` 分片（各自拉起一套
+6 节点集群，互不影响）；② 矩阵本身不再以字面量写在工作流里，而是由 `plan` 作业
+调用 `shards --format matrix` 渲染成单行 JSON（分片名 + 逐片 `timeout_minutes`），
+写进 `$GITHUB_OUTPUT` 后经 `fromJSON` 消费，墙钟预算随之逐片生效。
+
+| 关注点 | 实现 | 为什么这样切 |
+|---|---|---|
+| 演练隔离 | `redis-cluster-failover` 独立分片，自带 6 节点 + 初始化容器 | 演练会停主节点、改变槽位归属，与只读套件同片跑会互相污染；独立成片后也不再拖住别的分片 |
+| 矩阵取值 | `plan` 作业 → `--format matrix` → `outputs.matrix` → `fromJSON` | 工作流里**连分片名清单都不出现**，与「服务地址不出现」是同一条单一真值原则 |
+| 超时预算 | `Shard.timeout_minutes`（默认 `DEFAULT_TIMEOUT_MINUTES`）→ `timeout-minutes: ${{ matrix.timeout_minutes }}` | 演练与 ES 冷启动明显更慢，统一超时要么误杀慢分片、要么放任卡死的分片耗光 runner 的 6 小时上限 |
+| plan 作业成本 | 只装运行期依赖（`pip install -e .`）、不拉容器 | 它只 import 分片表并打印 JSON，几秒结束；与 integration 作业并行不同的依赖集，互不影响 |
+
+**理由**：
+
+* 演练与只读套件的资源冲突是**语义级**的（一个在停节点，一个在读数据），
+  分片表加一行就能拆开，比在同一分片里做顺序编排更可靠；
+* `timeout-minutes` 在 GitHub Actions 里是**作业级**表达式，只有矩阵值带得进去，
+  再一次说明「矩阵是数据而不是 YAML」；
+* 期望分片清单仍由 `shard_names()` 给出（ADR-16 的总账、ADR-17 的基线都基于它），
+  拆片对下游零改动：总账自动多一行，基线缓存自动多一份。
+
+**代价**：多一个 `plan` 作业（checkout + setup-python + `pip install -e .`，约数十秒）；
+集群类资源从「一片跑两遍套件」变成「两片各跑一遍」，夜间墙钟略增但确定性更好。
 
 ---
 
@@ -533,10 +562,10 @@ key 带 `run_id`、`restore-keys` 前缀命中上一次），由汇总作业自�
 | 真机守护的缺陷 | 集群弃用 `MULTI`（ES 索引模板、MySQL 同毫秒保序同理）——替身测不出的服务端行为由真机套件兜底 |
 | 高可用演练 | `test_redis_cluster_failover.py` 停掉主节点容器验证从节点晋升 + 读写可用 + 自动收敛；编排逻辑在 `testing/cluster.py` 中纯函数化，离线可测 |
 | 集成环境编排 | `docker-compose.integration.yml`（Redis / MySQL / ES 带健康检查 + Redis Cluster 三主三从 6 节点 + 一次性初始化容器）；可选工作流 `.github/workflows/integration.yml`（手动 + 每日夜间），跑用例前先过前置守卫 |
-| 分片并行 | `testing/shards.py` 把真机套件按服务切成四个矩阵分片（`redis` / `mysql` / `elasticsearch` / `redis-cluster`），每个分片只拉起自己的容器；分片表是单一真值来源，工作流不硬编码任何服务地址 / 分片名 / 容器名；离线单测在 `tests/test_integration/test_shards.py` |
+| 分片并行 | `testing/shards.py` 把真机套件按服务切成五个矩阵分片（`redis` / `mysql` / `elasticsearch` / `redis-cluster` / `redis-cluster-failover`），每个分片只拉起自己的容器；分片表是单一真值来源，工作流不硬编码任何服务地址 / 分片名 / 容器名 / 分片数量（连矩阵 JSON 都由 `plan` 作业的 `--format matrix` 生成，ADR-18）；每个分片声明自己的 `timeout_minutes` 墙钟预算；离线单测在 `tests/test_integration/test_shards.py` |
 | 假绿灯防护 | `testing/preflight.py` 按 `MED_MEMORY_IT_REQUIRED` 逐个探针，任一必需服务不可用即退出码 1——否则「用例集体 skip」会让环境故障伪装成通过；离线单测在 `tests/test_integration/test_preflight.py` |
 | 夜间趋势上报 | `testing/trend.py` 解析 JUnit 报告渲染 Markdown 摘要写入 Job Summary，报告经 `actions/cache` **按分片**滚动为下次基线；离线单测在 `tests/test_integration/test_trend.py` |
-| 分片结果聚合 | `testing/aggregate.py` 把四个分片的报告聚合成一份总账（分片明细 + 合计 + 缺失报告 + 失败用例 + 最慢用例）写入 Job Summary，并以退出码 `0/1/2/3` 区分「齐备无失败 / 缺报告 / 有失败 / 参数非法」；离线单测在 `tests/test_integration/test_aggregate.py` |
+| 分片结果聚合 | `testing/aggregate.py` 把五个分片的报告聚合成一份总账（分片明细 + 合计 + 缺失报告 + 失败用例 + 最慢用例）写入 Job Summary，并以退出码 `0/1/2/3` 区分「齐备无失败 / 缺报告 / 有失败 / 参数非法」；离线单测在 `tests/test_integration/test_aggregate.py` |
 | 总账基线对比 | 同一模块的 `AggregateTrend` / `build_aggregate_trend` 拿 `--baseline-dir` 的上一轮报告算出整轮合计变化、逐分片状态与跨分片的新增失败 / 已修复；`--snapshot-dir` 把本轮报告写进 `baseline/` 由 `actions/cache` 滚动给下一轮；无基线时该小节整体消失（纯增量）；离线单测同上，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestAggregateBaseline` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |

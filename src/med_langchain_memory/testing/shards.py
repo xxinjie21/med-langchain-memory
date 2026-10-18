@@ -9,9 +9,10 @@
 
 设计取舍：
 
-* **单一真值来源**：用例路径、必需服务、compose 服务名、服务地址环境变量全部由
-  本模块生成（服务地址复用 :mod:`med_langchain_memory.testing.services` 的默认值），
-  工作流里**不再出现任何 ``MED_MEMORY_IT_*_URL`` 字面量**，杜绝两处漂移；
+* **单一真值来源**：用例路径、必需服务、compose 服务名、服务地址环境变量、矩阵取值与
+  超时预算全部由本模块生成（服务地址复用 :mod:`med_langchain_memory.testing.services`
+  的默认值），工作流里**不再出现任何 ``MED_MEMORY_IT_*_URL`` 字面量、也不再出现分片名清单**，
+  杜绝两处漂移；
 * **只依赖标准库**（外加同样只依赖标准库的 ``testing.services`` / ``testing.preflight``），
   不做协议握手、不做任何文本处理；
 * 集群分片的一次性初始化容器（``redis-cluster-init``）也由分片表描述，
@@ -23,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -39,10 +41,19 @@ INTEGRATION_TEST_DIR = "tests/test_integration"
 ALL_SHARDS = "all"
 
 #: ``--format`` 支持的全部取值。
-FORMATS: tuple[str, ...] = ("table", "paths", "required", "compose", "init", "env")
+FORMATS: tuple[str, ...] = ("table", "paths", "required", "compose", "init", "env", "matrix")
 
 #: 集群分片的一次性初始化容器名（与 ``docker-compose.integration.yml`` 一致）。
 CLUSTER_INITIALIZER = "redis-cluster-init"
+
+#: 分片未显式声明超时预算时使用的默认值（分钟）。
+DEFAULT_TIMEOUT_MINUTES = 20
+
+#: 矩阵 JSON 里的分片名列表键（工作流 ``matrix.shard``）。
+MATRIX_SHARD_KEY = "shard"
+
+#: 矩阵 JSON 里的超时预算列表键（工作流 ``matrix.timeout_minutes``）。
+MATRIX_TIMEOUT_KEY = "timeout_minutes"
 
 
 def _cluster_compose_services() -> tuple[str, ...]:
@@ -74,6 +85,9 @@ class Shard:
     #: 该分片需要 ``docker compose up`` 拉起的服务名。
     compose_services: tuple[str, ...]
 
+    #: 该分片的墙钟预算（分钟），直接映射到工作流的 ``timeout-minutes``。
+    timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES
+
     #: 拉起后需要执行的一次性初始化容器名；无需初始化时为 ``None``。
     initializer: str | None = None
 
@@ -91,6 +105,7 @@ SHARDS: tuple[Shard, ...] = (
         pytest_paths=(f"{INTEGRATION_TEST_DIR}/test_redis_live.py",),
         services=("redis",),
         compose_services=("redis",),
+        timeout_minutes=15,
     ),
     Shard(
         name="mysql",
@@ -98,6 +113,7 @@ SHARDS: tuple[Shard, ...] = (
         pytest_paths=(f"{INTEGRATION_TEST_DIR}/test_mysql_live.py",),
         services=("mysql",),
         compose_services=("mysql",),
+        timeout_minutes=20,
     ),
     Shard(
         name="elasticsearch",
@@ -105,16 +121,26 @@ SHARDS: tuple[Shard, ...] = (
         pytest_paths=(f"{INTEGRATION_TEST_DIR}/test_es_live.py",),
         services=("elasticsearch",),
         compose_services=("elasticsearch",),
+        timeout_minutes=30,
     ),
     Shard(
         name="redis-cluster",
-        title="Redis Cluster live + failover drill",
-        pytest_paths=(
-            f"{INTEGRATION_TEST_DIR}/test_redis_cluster_live.py",
-            f"{INTEGRATION_TEST_DIR}/test_redis_cluster_failover.py",
-        ),
+        title="Redis Cluster live suite",
+        pytest_paths=(f"{INTEGRATION_TEST_DIR}/test_redis_cluster_live.py",),
         services=("redis-cluster",),
         compose_services=_cluster_compose_services(),
+        timeout_minutes=30,
+        initializer=CLUSTER_INITIALIZER,
+    ),
+    # 破坏性演练（停主节点）单独成片：它自己拉起一套集群，因此不会污染同批次的
+    # 只读套件；也因为它最慢，独立成片后不再拖住别的分片。
+    Shard(
+        name="redis-cluster-failover",
+        title="Redis Cluster failover drill",
+        pytest_paths=(f"{INTEGRATION_TEST_DIR}/test_redis_cluster_failover.py",),
+        services=("redis-cluster",),
+        compose_services=_cluster_compose_services(),
+        timeout_minutes=25,
         initializer=CLUSTER_INITIALIZER,
     ),
 )
@@ -270,6 +296,23 @@ def render_env(shards: Sequence[Shard], env: Mapping[str, str] | None = None) ->
     return "\n".join(f"{key}={value}" for key, value in lines)
 
 
+def render_matrix(shards: Sequence[Shard]) -> str:
+    """渲染成 GitHub Actions 的 ``strategy.matrix`` JSON（单行）。
+
+    Args:
+        shards: 分片序列。
+
+    Returns:
+        形如 ``{"shard":["redis",...],"timeout_minutes":[15,...]}`` 的单行 JSON，
+        两个数组等长且按索引配对，可直接喂给 ``matrix: ${{ fromJSON(...) }}``。
+    """
+    payload = {
+        MATRIX_SHARD_KEY: [shard.name for shard in shards],
+        MATRIX_TIMEOUT_KEY: [shard.timeout_minutes for shard in shards],
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
 def render_table(shards: Sequence[Shard]) -> str:
     """渲染人可读的分片清单（``--format table``）。
 
@@ -277,14 +320,15 @@ def render_table(shards: Sequence[Shard]) -> str:
         shards: 分片序列。
 
     Returns:
-        每行一个分片：``名称  服务  init  用例路径``；未选中任何分片时返回提示行。
+        每行一个分片：``名称  服务  init  超时  用例路径``；未选中任何分片时返回提示行。
     """
     if not shards:
         return "no shards selected"
     width = max(len(shard.name) for shard in shards)
     return "\n".join(
         f"{shard.name.ljust(width)}  services={shard.required}"
-        f"  init={shard.initializer or '-'}  paths={' '.join(shard.pytest_paths)}"
+        f"  init={shard.initializer or '-'}  timeout={shard.timeout_minutes}m"
+        f"  paths={' '.join(shard.pytest_paths)}"
         for shard in shards
     )
 
@@ -336,6 +380,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "compose": render_compose,
         "init": render_init,
         "env": render_env,
+        "matrix": render_matrix,
     }
     print(renderers[args.format](shards))
     return 0

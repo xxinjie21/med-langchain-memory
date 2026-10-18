@@ -7,7 +7,9 @@ These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
   and must never be merged into the mandatory ``ci.yml`` gate;
 * it must run as a **shard matrix** whose entries are exactly the shards the real
   ``med_langchain_memory.testing.shards`` module declares, with ``fail-fast: false``
-  so one red shard does not hide the others;
+  so one red shard does not hide the others; the matrix itself (shard names plus the
+  per-shard timeout budgets) must be rendered by that module inside a ``plan`` job
+  and consumed by the matrix job through ``fromJSON``;
 * every shard must start **only its own** containers through
   ``docker-compose.integration.yml`` (``services:`` cannot be sharded per matrix
   entry), and every compose service name it asks for must exist in that file;
@@ -36,6 +38,7 @@ These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import tomllib
@@ -44,10 +47,15 @@ from pathlib import Path
 import pytest
 
 from med_langchain_memory.testing import (
+    CLUSTER_INITIALIZER,
     DEFAULT_SERVICES,
     ENV_PREFIX,
     ENV_REQUIRED,
+    MATRIX_SHARD_KEY,
+    MATRIX_TIMEOUT_KEY,
+    SHARDS,
     render_env,
+    render_matrix,
     render_paths,
     render_required,
     resolve_shard,
@@ -191,6 +199,17 @@ def aggregate_job_body() -> str:
     return match.group("body")
 
 
+def job_body(job: str) -> str:
+    """Return the YAML body of a top-level job (truncated at the next job)."""
+    match = re.search(
+        rf"^ {{2}}{re.escape(job)}:\n(?P<body>.*?)(?=\n {{2}}\S|\Z)",
+        read_workflow(),
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"job {job!r} is missing from the workflow"
+    return match.group("body")
+
+
 class TestWorkflowFile:
     def test_workflow_exists_and_readable(self) -> None:
         """正向：工作流文件存在且以 ``name:`` 开头。"""
@@ -230,14 +249,16 @@ class TestShardMatrix:
     """分片矩阵：作业必须按真实分片表切分，且一个分片红不掩盖其它分片。"""
 
     def test_matrix_matches_the_real_shard_table(self) -> None:
-        """正向：矩阵取值与 ``shard_names()`` 逐字一致（改一处必须改另一处）。"""
-        match = re.search(r"shard:\s*\[(?P<names>[^\]]+)\]", read_workflow())
-        assert match is not None, "the shard matrix is missing"
-        declared = tuple(name.strip() for name in match.group("names").split(","))
-        assert declared == shard_names()
+        """正向：矩阵取值与超时预算和 ``shard_names()`` / 分片表逐字一致（改一处必须改另一处）。"""
+        text = read_workflow()
+        assert "matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}" in text
+        assert "timeout-minutes: ${{ matrix.timeout_minutes }}" in text
+        payload = json.loads(render_matrix(select_shards()))
+        assert payload[MATRIX_SHARD_KEY] == list(shard_names())
+        assert payload[MATRIX_TIMEOUT_KEY] == [shard.timeout_minutes for shard in SHARDS]
 
     def test_matrix_does_not_use_fail_fast(self) -> None:
-        """边界：一个分片失败不得取消其它分片（四个服务的结论都要拿到）。"""
+        """边界：一个分片失败不得取消其它分片（每个服务的结论都要拿到）。"""
         text = read_workflow()
         assert "strategy:" in text
         assert "fail-fast: false" in text
@@ -246,6 +267,43 @@ class TestShardMatrix:
     def test_job_name_includes_the_shard(self) -> None:
         """正向：作业名带分片名，Job Summary 里能分辨是哪个分片。"""
         assert re.search(r"^ {4}name:\s*\S.*matrix\.shard", read_workflow(), re.MULTILINE)
+
+
+class TestPlanJob:
+    """矩阵真值：``plan`` 作业把分片表渲染成 JSON，``integration`` 作业原样消费。"""
+
+    def test_plan_job_exposes_the_matrix_output(self) -> None:
+        """正向：plan 作业存在，并把矩阵声明为作业级输出。"""
+        body = job_body("plan")
+        assert re.search(r"^ {4}outputs:\n^ {6}matrix:", body, re.MULTILINE)
+
+    def test_matrix_is_emitted_by_the_real_shards_cli(self) -> None:
+        """边界：工作流渲染矩阵的命令必须能被真实解析器解析，且输出单行 JSON。"""
+        body = job_body("plan")
+        assert f"python -m {SHARDS_MODULE} --format matrix" in body
+        assert '>> "$GITHUB_OUTPUT"' in body
+
+    def test_integration_job_consumes_the_plan_output(self) -> None:
+        """正向：integration 作业 ``needs: plan`` 并把输出喂给 ``fromJSON``。"""
+        body = job_body("integration")
+        assert re.search(r"^ {4}needs:\s*plan\b", body, re.MULTILINE)
+        assert "matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}" in body
+
+    def test_plan_job_installs_runtime_dependencies_only(self) -> None:
+        """边界：plan 作业只 import 分片表，装运行期依赖即可（不拉 dev extras）。"""
+        body = job_body("plan")
+        assert "pip install -e ." in body
+        assert ".[dev]" not in body
+
+    def test_plan_job_starts_no_containers(self) -> None:
+        """边界：plan 作业只算矩阵，不碰任何中间件。"""
+        assert "docker compose" not in job_body("plan")
+
+    def test_plan_runs_before_integration_and_aggregate(self) -> None:
+        """边界：作业顺序必须是 plan → integration → aggregate。"""
+        text = read_workflow()
+        assert text.index("\n  plan:\n") < text.index("\n  integration:\n")
+        assert text.index("\n  integration:\n") < text.index("\n  aggregate:\n")
 
 
 class TestJob:
@@ -292,9 +350,19 @@ class TestJob:
         parsed = [
             build_shards_parser().parse_args(shlex.split(args)) for args in shards_invocations()
         ]
-        assert {item.format for item in parsed} == {"env", "compose", "init", "paths"}
+        assert {item.format for item in parsed} == {
+            "env",
+            "compose",
+            "init",
+            "paths",
+            "matrix",
+        }
+        matrix_invocations = [item for item in parsed if item.format == "matrix"]
+        assert len(matrix_invocations) == 1, "the plan job must render the matrix exactly once"
+        assert matrix_invocations[0].shard == [], "matrix rendering always covers every shard"
         for item in parsed:
-            assert item.shard == [SAMPLE_SHARD]
+            if item.format != "matrix":
+                assert item.shard == [SAMPLE_SHARD]
 
     def test_shard_services_are_started_through_compose(self) -> None:
         """正向：只拉起本分片需要的容器，并等健康检查通过。"""
@@ -354,23 +422,25 @@ class TestPreflightGuard:
 class TestRedisClusterShard:
     """Redis Cluster 由 compose 拉起（``services:`` 只支持单容器，且无法分片）。"""
 
-    def test_cluster_shard_starts_all_six_nodes(self) -> None:
-        """正向：集群分片声明 6 个节点，工作流通过 ``--format compose`` 交给 compose。"""
-        cluster = resolve_shard("redis-cluster")
+    @pytest.mark.parametrize("name", ["redis-cluster", "redis-cluster-failover"])
+    def test_cluster_shards_start_all_six_nodes(self, name: str) -> None:
+        """正向：两个集群分片各自声明 6 个节点，工作流通过 ``--format compose`` 交给 compose。"""
+        cluster = resolve_shard(name)
         assert len(cluster.compose_services) == 6
         for index in range(1, 7):
             assert f"redis-cluster-{index}" in cluster.compose_services
 
-    def test_cluster_shard_runs_the_one_shot_initializer(self) -> None:
+    def test_cluster_shards_run_the_one_shot_initializer(self) -> None:
         """正向：初始化容器由 ``--format init`` 给出，工作流不硬编码容器名。"""
-        assert resolve_shard("redis-cluster").initializer == "redis-cluster-init"
+        for name in ("redis-cluster", "redis-cluster-failover"):
+            assert resolve_shard(name).initializer == CLUSTER_INITIALIZER
         assert "--format init" in read_workflow()
         assert "redis-cluster-init" not in read_workflow()
 
     def test_non_cluster_shards_have_no_initializer(self) -> None:
         """边界：非集群分片不声明初始化容器（``--format init`` 输出空串即跳过）。"""
         for name in shard_names():
-            if name != "redis-cluster":
+            if not name.startswith("redis-cluster"):
                 assert resolve_shard(name).initializer is None
 
     def test_sets_cluster_announce_ip_for_linux_runner(self) -> None:
@@ -443,7 +513,7 @@ class TestTrendReporting:
 
 
 class TestAggregateJob:
-    """汇总作业：把四个分片的报告合成一份总账，并给出整轮唯一的结论退出码。"""
+    """汇总作业：把五个分片的报告合成一份总账，并给出整轮唯一的结论退出码。"""
 
     def test_job_waits_for_the_matrix_and_always_runs(self) -> None:
         """正向：汇总作业依赖矩阵作业，且无论矩阵成败都要出总账。"""
@@ -457,7 +527,7 @@ class TestAggregateJob:
         assert text.index("\n  integration:\n") < text.index("\n  aggregate:\n")
 
     def test_downloads_every_shard_artifact_by_prefix(self) -> None:
-        """正向：按 artifact 名前缀一次性下载四个分片的报告目录。"""
+        """正向：按 artifact 名前缀一次性下载五个分片的报告目录。"""
         text = read_workflow()
         assert "actions/download-artifact@v4" in text
         assert f"pattern: {ARTIFACT_PREFIX}*" in text

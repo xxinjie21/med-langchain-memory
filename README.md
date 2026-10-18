@@ -261,7 +261,7 @@ docker compose -f docker-compose.integration.yml down -v
 | 地址覆盖 | `MED_MEMORY_IT_REDIS_URL` / `MED_MEMORY_IT_MYSQL_URL` / `MED_MEMORY_IT_ELASTICSEARCH_URL` / `MED_MEMORY_IT_REDIS_CLUSTER_URL` |
 | 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引、hash tag 同 slot、集群 pipeline 语义、集群故障转移） |
 | MySQL 前置 | DBAPI 驱动 `pymysql` 随 `[mysql]` / `[dev]` extras 一起装，缺失时 MySQL 用例跳过 |
-| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；按服务**分片并行**，跑之前先过分片前置守卫，每个分片各自产出趋势摘要并滚动缓存报告供下次对比，最后由汇总作业把四份报告合成一份总账（见下） |
+| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；按服务**分片并行**，跑之前先过分片前置守卫，每个分片各自产出趋势摘要并滚动缓存报告供下次对比，最后由汇总作业把五份报告合成一份总账（见下） |
 
 探针与开关逻辑在 `med_langchain_memory/testing/services.py`，只用标准库，
 因此「能不能跑」的判断本身不依赖任何中间件客户端。
@@ -289,22 +289,25 @@ MED_MEMORY_IT=1 pytest -m integration
 
 ### 分片并行与分片解析
 
-真机套件按服务切成四个**互不依赖**的分片，每个分片在自己的 CI runner 上只拉起
-自己需要的容器，墙钟时间由「最慢的那个分片」决定，而不是「四个服务串行之和」：
+真机套件按服务切成五个**互不依赖**的分片，每个分片在自己的 CI runner 上只拉起
+自己需要的容器，墙钟时间由「最慢的那个分片」决定，而不是「全部服务串行之和」。
+破坏性演练（停主节点 → 从节点晋升）单独成片：它自己起一套集群，不污染只读套件：
 
-| 分片 | 用例 | 需要的服务 | 额外步骤 |
-|---|---|---|---|
-| `redis` | `test_redis_live.py` | `redis` | — |
-| `mysql` | `test_mysql_live.py` | `mysql` | — |
-| `elasticsearch` | `test_es_live.py` | `elasticsearch` | — |
-| `redis-cluster` | `test_redis_cluster_live.py` + `test_redis_cluster_failover.py` | `redis-cluster` | 6 节点 + `redis-cluster-init` 一次性组集群 |
+| 分片 | 用例 | 需要的服务 | 额外步骤 | 超时预算 |
+|---|---|---|---|---|
+| `redis` | `test_redis_live.py` | `redis` | — | 15m |
+| `mysql` | `test_mysql_live.py` | `mysql` | — | 20m |
+| `elasticsearch` | `test_es_live.py` | `elasticsearch` | — | 30m |
+| `redis-cluster` | `test_redis_cluster_live.py` | `redis-cluster` | 6 节点 + `redis-cluster-init` 一次性组集群 | 30m |
+| `redis-cluster-failover` | `test_redis_cluster_failover.py` | `redis-cluster` | 6 节点 + `redis-cluster-init` 一次性组集群 | 25m |
 
-分片表（用例路径 / 必需服务 / compose 服务名 / 初始化容器 / 环境变量）是
+分片表（用例路径 / 必需服务 / compose 服务名 / 初始化容器 / 环境变量 / 超时预算）是
 **单一真值来源**，由 `med_langchain_memory/testing/shards.py` 生成（纯标准库），
-工作流里不出现任何服务地址字面量，也不硬编码分片名与容器名——新增分片只需改那个模块：
+工作流里不出现任何服务地址字面量，也不硬编码分片名、容器名与分片数量——新增分片只需改那个模块：
 
 ```bash
 python -m med_langchain_memory.testing.shards                                   # 列出全部分片
+python -m med_langchain_memory.testing.shards --format matrix                   # GitHub Actions 矩阵 JSON（分片名 + 超时预算）
 python -m med_langchain_memory.testing.shards --shard mysql --format required   # redis,mysql… 里本分片那几项
 python -m med_langchain_memory.testing.shards --shard redis --format paths      # 可直接拼在 pytest 后面
 python -m med_langchain_memory.testing.shards --shard redis-cluster --format compose
@@ -315,7 +318,8 @@ python -m med_langchain_memory.testing.shards --shard redis --format env        
 | 项 | 说明 |
 |---|---|
 | `--shard` | 可重复；省略或传 `all` 表示全部分片；分片名拼错时退出码 `2` 并把合法取值写进 stderr |
-| `--format` | `table`（默认）/ `paths` / `required` / `compose` / `init` / `env` |
+| `--format` | `table`（默认）/ `paths` / `required` / `compose` / `init` / `env` / `matrix` |
+| 墙钟预算 | 分片表逐片声明 `timeout_minutes`（未声明时落到 `DEFAULT_TIMEOUT_MINUTES`），`--format matrix` 一并输出，工作流 `timeout-minutes: ${{ matrix.timeout_minutes }}` 逐片生效——卡死的 compose 或 pytest 会被及时掐掉，而不是耗光 runner 的 6 小时上限 |
 | 环境透传 | `--format env` 会读本机环境变量：本地覆盖了某个服务地址时原样透传，本地与 CI 行为一致 |
 
 本地按分片跑单个后端（只起该分片的容器）：
@@ -329,8 +333,10 @@ docker compose -f docker-compose.integration.yml down -v
 
 ### 夜间 CI 与趋势上报
 
-`integration.yml` 每日 18:00 UTC（北京时间次日 02:00）跑一次，四个分片并行，
-每个分片除了执行用例还做四件事：
+`integration.yml` 每日 18:00 UTC（北京时间次日 02:00）跑一次，五个分片并行。
+矩阵本身也是数据：`plan` 作业先用 `--format matrix` 把分片表渲染成单行 JSON
+（分片名 + 逐片超时预算）写进 `$GITHUB_OUTPUT`，`integration` 作业 `needs: plan`
+并用 `fromJSON` 消费，`timeout-minutes` 逐片生效。每个分片除了执行用例还做四件事：
 
 | 步骤 | 动作 |
 |---|---|
@@ -341,7 +347,7 @@ docker compose -f docker-compose.integration.yml down -v
 | 摘要 | `python -m med_langchain_memory.testing.trend reports/<分片>/integration.xml --baseline reports/<分片>/previous.xml` 渲染 Markdown 写进 Job Summary（用例数 / 通过率 / **新增失败** / **已修复** / 最慢用例） |
 | 滚动 | `reports/<分片>/` 走 `actions/cache`，key 带分片名与 `run_id`、`restore-keys` 前缀命中**同一分片**的上一次；恢复出的报告改名 `previous.xml` 作为本次基线 |
 
-`fail-fast: false`：一个分片红不代表其它分片没有价值，四个分片各自出结论。
+`fail-fast: false`：一个分片红不代表其它分片没有价值，五个分片各自出结论。
 
 趋势渲染逻辑在 `med_langchain_memory/testing/trend.py`，**纯标准库**
 （`xml.etree.ElementTree`），汇总口径一律从 `<testcase>` 子节点推导，
@@ -356,8 +362,8 @@ python -m med_langchain_memory.testing.trend reports/redis/integration.xml --out
 
 ### 分片结果聚合（汇总作业）
 
-四个分片跑完后，`aggregate` 作业（`needs: integration` + `if: always()`）把四份 JUnit
-报告合成一份总账贴进 Job Summary，并给出**整轮唯一的结论退出码**——不必点开四个作业
+五个分片跑完后，`aggregate` 作业（`needs: integration` + `if: always()`）把五份 JUnit
+报告合成一份总账贴进 Job Summary，并给出**整轮唯一的结论退出码**——不必点开五个作业
 才知道今晚绿没绿：
 
 | 内容 | 说明 |

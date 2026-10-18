@@ -3,21 +3,23 @@ name: Integration
 # 真实中间件集成测试：**可选**，不阻塞日常 CI（ci.yml 仍为唯一必过门禁）。
 # 触发方式：手动 workflow_dispatch，或每日 18:00 UTC（北京时间次日 02:00）夜间定时跑一次。
 #
-# 分片并行：四个真机套件按服务切成四个矩阵分片（redis / mysql / elasticsearch /
-# redis-cluster），每个分片在自己的 runner 上**只拉起自己需要的容器**，
-# 于是墙钟时间由「最慢的那个分片」决定，而不是「四个服务串行之和」。
+# 分片并行：真机套件按服务切成五个矩阵分片（redis / mysql / elasticsearch /
+# redis-cluster / redis-cluster-failover），每个分片在自己的 runner 上**只拉起自己需要的容器**，
+# 于是墙钟时间由「最慢的那个分片」决定，而不是「全部服务串行之和」。
+# 破坏性演练（停主节点 → 从节点晋升）单独成片：它自己起一套集群，不污染只读套件。
 #
-# 分片表（用例路径 / 必需服务 / compose 服务名 / 初始化容器 / 环境变量）由
-# `med_langchain_memory.testing.shards` 生成，工作流里**不出现任何服务地址字面量**，
-# 也不硬编码分片名与容器名——新增分片只需改那个模块。
+# 分片表（用例路径 / 必需服务 / compose 服务名 / 初始化容器 / 环境变量 / 超时预算）
+# 由 `med_langchain_memory.testing.shards` 生成：`plan` 作业把它算成矩阵 JSON
+# 写进 `$GITHUB_OUTPUT`，`integration` 作业用 `fromJSON` 消费——工作流里**不出现任何
+# 服务地址字面量，也不出现分片名清单**，新增分片只需改那个模块。
 #
 # 中间件统一走 docker compose：`services:` 无法按矩阵分片（会让每个分片都拉起全部容器），
 # 而 Redis Cluster 本来就只能用 compose。compose 里每个长驻服务都有 healthcheck，
 # `up -d --wait` 会等到健康后再进入守卫与用例步骤。
 #
-# 汇总作业：四个分片跑完后由 `aggregate` 作业把四份 JUnit 报告聚合成一份总账
+# 汇总作业：五个分片跑完后由 `aggregate` 作业把五份 JUnit 报告聚合成一份总账
 # （分片明细 + 合计 + 缺失报告 + 失败用例）贴进 Job Summary，并用单一退出码
-# 给出整轮结论——不必点开四个作业才知道今晚绿没绿。
+# 给出整轮结论——不必点开五个作业才知道今晚绿没绿。
 # 总账本身还会与**上一轮总账**对比（用例数 / 失败数 / 通过率 / 耗时的变化 +
 # 逐分片状态 + 跨分片的新增失败与已修复）：上一轮的报告由本作业末尾的快照
 # 写进 `baseline/`，靠滚动缓存传给下一次运行，不需要任何外部存储。
@@ -32,14 +34,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 分片矩阵的唯一真值来源：分片表 → 单行 JSON → 作业输出。
+  plan:
+    name: Plan shard matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # 只装运行期依赖：这一步只为了 import 分片表并打印 JSON，不需要 dev extras。
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Emit shard matrix
+        id: matrix
+        run: echo "matrix=$(python -m med_langchain_memory.testing.shards --format matrix)" >> "$GITHUB_OUTPUT"
+
   integration:
     name: Integration (${{ matrix.shard }})
+    needs: plan
     runs-on: ubuntu-latest
-    # fail-fast: false —— 一个分片红不代表其它分片没有价值，四个分片各自出结论。
+    # 墙钟预算由分片表逐片给出：卡死的 compose 或 pytest 会被及时掐掉，
+    # 而不是把 runner 的 6 小时上限耗光。
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    # fail-fast: false —— 一个分片红不代表其它分片没有价值，五个分片各自出结论。
     strategy:
       fail-fast: false
-      matrix:
-        shard: [redis, mysql, elasticsearch, redis-cluster]
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
       # 集群节点广播地址：Linux runner 上编排固定子网的网关双向可达，无需像
       # Docker Desktop 那样覆盖成宿主机局域网 IP。
@@ -129,12 +157,12 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.integration.yml down -v
 
-  # 汇总作业：把四个分片的报告合成一份总账，并给出整轮唯一的结论退出码。
+  # 汇总作业：把五个分片的报告合成一份总账，并给出整轮唯一的结论退出码。
   # 期望的分片清单由分片表决定（与上面矩阵取值同源），工作流不重复声明。
   aggregate:
     name: Aggregate shard reports
     needs: integration
-    # 矩阵作业用 fail-fast: false 跑完四个分片，这里无论成败都要出总账。
+    # 矩阵作业用 fail-fast: false 跑完五个分片，这里无论成败都要出总账。
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -149,7 +177,7 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
-      # 四个分片的报告 artifact 解到 reports/ 下；目录名即 artifact 名，
+      # 五个分片的报告 artifact 解到 reports/ 下；目录名即 artifact 名，
       # 聚合模块对这种「下载布局」与本地「reports/<分片>/」布局都认。
       - name: Download shard reports
         uses: actions/download-artifact@v4
@@ -157,7 +185,7 @@ jobs:
           pattern: integration-report-*
           path: reports
 
-      # 滚动总账基线：恢复上一轮由 --snapshot-dir 写下的四个分片报告，
+      # 滚动总账基线：恢复上一轮由 --snapshot-dir 写下的五个分片报告，
       # 本轮聚合时据此给出「整轮 vs 上一轮」的对比。key 带 run_id 保证每次都写新条目，
       # restore-keys 前缀命中上一次；首次运行缓存未命中时不渲染对比小节。
       - name: Restore previous ledger baseline

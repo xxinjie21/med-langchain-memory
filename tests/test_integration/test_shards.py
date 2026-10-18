@@ -5,14 +5,15 @@
 集群分片覆盖 6 个节点与初始化容器），边界用例覆盖「未选中任何分片」
 「分片名拼错」「服务名与服务表脱节」「环境变量被覆盖」等分支。
 
-每个公开成员均含正向与边界用例：``Shard.required`` / ``SHARDS`` /
+每个公开成员均含正向与边界用例：``Shard.required`` / ``Shard.timeout_minutes`` / ``SHARDS`` /
 ``shard_names`` / ``resolve_shard`` / ``select_shards`` / ``required_services`` /
 ``render_paths`` / ``render_required`` / ``render_compose`` / ``render_init`` /
-``render_env`` / ``render_table`` / ``build_parser`` / ``main``。
+``render_env`` / ``render_table`` / ``render_matrix`` / ``build_parser`` / ``main``。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -24,16 +25,20 @@ from med_langchain_memory.exceptions import ValidationError
 from med_langchain_memory.testing import (
     ALL_SHARDS,
     CLUSTER_INITIALIZER,
+    DEFAULT_TIMEOUT_MINUTES,
     ENV_PREFIX,
     ENV_REQUIRED,
     FORMATS,
     INTEGRATION_TEST_DIR,
+    MATRIX_SHARD_KEY,
+    MATRIX_TIMEOUT_KEY,
     REDIS_CLUSTER_NODE_PORTS,
     SHARDS,
     Shard,
     render_compose,
     render_env,
     render_init,
+    render_matrix,
     render_paths,
     render_required,
     render_table,
@@ -50,7 +55,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SHARDS_MODULE = "med_langchain_memory.testing.shards"
 
 #: 期望的分片集合（与工作流矩阵一致，改这里就等于改契约）。
-EXPECTED_SHARD_NAMES = ("redis", "mysql", "elasticsearch", "redis-cluster")
+EXPECTED_SHARD_NAMES = (
+    "redis",
+    "mysql",
+    "elasticsearch",
+    "redis-cluster",
+    "redis-cluster-failover",
+)
+
+#: 使用 Redis Cluster 的分片（各自拉起一套 6 节点集群）。
+CLUSTER_SHARD_NAMES = ("redis-cluster", "redis-cluster-failover")
 
 #: 服务表里的服务名（分片只能引用它们）。
 KNOWN_SERVICES = ("redis", "mysql", "elasticsearch", "redis-cluster")
@@ -58,7 +72,7 @@ KNOWN_SERVICES = ("redis", "mysql", "elasticsearch", "redis-cluster")
 
 class TestShardTable:
     def test_shard_names_are_unique_and_complete(self) -> None:
-        """正向：分片名不重复，且覆盖四个真机服务。"""
+        """正向：分片名不重复，且覆盖全部真机分片。"""
         names = shard_names()
         assert names == EXPECTED_SHARD_NAMES
         assert len(set(names)) == len(names)
@@ -92,17 +106,41 @@ class TestShardTable:
         assert len(cluster.compose_services) == len(REDIS_CLUSTER_NODE_PORTS)
         assert cluster.initializer == CLUSTER_INITIALIZER
 
-    def test_only_the_cluster_shard_needs_an_initializer(self) -> None:
-        """边界：其余分片不声明初始化容器（否则工作流会多跑一步无用命令）。"""
-        others = [shard for shard in SHARDS if shard.name != "redis-cluster"]
-        assert others
-        assert all(shard.initializer is None for shard in others)
+    def test_only_the_cluster_shards_need_an_initializer(self) -> None:
+        """边界：只有集群分片声明初始化容器，其余分片不声明（工作流会少跑一步无用命令）。"""
+        for shard in SHARDS:
+            if shard.name in CLUSTER_SHARD_NAMES:
+                assert shard.initializer == CLUSTER_INITIALIZER, shard.name
+            else:
+                assert shard.initializer is None, shard.name
+        assert not {shard.name for shard in SHARDS if shard.initializer} - set(CLUSTER_SHARD_NAMES)
 
-    def test_cluster_shard_runs_both_live_and_failover_suites(self) -> None:
-        """正向：集群分片的用例集合含真机套件与破坏性故障转移演练。"""
+    def test_cluster_live_shard_runs_only_the_live_suite(self) -> None:
+        """正向：只读集群分片只跑真机套件，停主节点的演练不属于它。"""
         paths = resolve_shard("redis-cluster").pytest_paths
         assert f"{INTEGRATION_TEST_DIR}/test_redis_cluster_live.py" in paths
-        assert f"{INTEGRATION_TEST_DIR}/test_redis_cluster_failover.py" in paths
+        assert f"{INTEGRATION_TEST_DIR}/test_redis_cluster_failover.py" not in paths
+
+    def test_failover_drill_is_its_own_shard(self) -> None:
+        """正向：破坏性演练独立成片，不污染同批次的只读套件。"""
+        drill = resolve_shard("redis-cluster-failover")
+        assert drill.pytest_paths == (f"{INTEGRATION_TEST_DIR}/test_redis_cluster_failover.py",)
+        assert drill.services == ("redis-cluster",)
+        assert drill.compose_services == tuple(f"redis-cluster-{index}" for index in range(1, 7))
+
+    def test_cluster_shards_together_cover_both_suites(self) -> None:
+        """边界：两个集群分片的并集仍覆盖真机套件与演练，不重不漏。"""
+        covered = [
+            relative
+            for name in CLUSTER_SHARD_NAMES
+            for relative in resolve_shard(name).pytest_paths
+        ]
+        assert sorted(covered) == sorted(
+            [
+                f"{INTEGRATION_TEST_DIR}/test_redis_cluster_live.py",
+                f"{INTEGRATION_TEST_DIR}/test_redis_cluster_failover.py",
+            ]
+        )
 
 
 class TestResolveShard:
@@ -237,6 +275,12 @@ class TestRenderPlan:
         assert f"services=redis-cluster  init={CLUSTER_INITIALIZER}" in table
         assert "init=-" in table
 
+    def test_table_shows_the_timeout_budget_per_shard(self) -> None:
+        """正向：表格带超时预算列，与分片表声明逐字一致。"""
+        table = render_table(SHARDS)
+        for shard in SHARDS:
+            assert f"timeout={shard.timeout_minutes}m" in table
+
     def test_table_without_shards_returns_a_placeholder(self) -> None:
         """边界：未选中分片时给出可读提示而不是抛异常。"""
         assert render_table(()) == "no shards selected"
@@ -286,6 +330,61 @@ class TestRenderEnv:
             assert value
 
 
+class TestTimeoutBudget:
+    """墙钟预算：每个分片声明自己的 ``timeout_minutes``，默认值统一兜底。"""
+
+    def test_every_shard_declares_a_positive_timeout(self) -> None:
+        """正向：每个分片的超时预算都是正整数，演练与 ES 分片比普通分片宽。"""
+        for shard in SHARDS:
+            assert isinstance(shard.timeout_minutes, int)
+            assert shard.timeout_minutes > 0, shard.name
+        assert (
+            resolve_shard("elasticsearch").timeout_minutes > resolve_shard("redis").timeout_minutes
+        )
+        assert (
+            resolve_shard("redis-cluster-failover").timeout_minutes
+            > resolve_shard("redis").timeout_minutes
+        )
+
+    def test_default_timeout_used_when_not_declared(self) -> None:
+        """边界：未显式声明时分片落到模块级默认值（构造替身即可验证）。"""
+        bare = Shard(
+            name="bare",
+            title="bare",
+            pytest_paths=("tests/test_integration/test_redis_live.py",),
+            services=("redis",),
+            compose_services=("redis",),
+        )
+        assert bare.timeout_minutes == DEFAULT_TIMEOUT_MINUTES
+        assert DEFAULT_TIMEOUT_MINUTES > 0
+
+
+class TestRenderMatrix:
+    """``--format matrix``：把分片表渲染成 GitHub Actions 的矩阵 JSON。"""
+
+    def test_matrix_pairs_shard_names_with_timeouts(self) -> None:
+        """正向：两个数组等长、按索引配对，取值与分片表逐字一致。"""
+        payload = json.loads(render_matrix(SHARDS))
+        assert payload[MATRIX_SHARD_KEY] == list(shard_names())
+        assert payload[MATRIX_TIMEOUT_KEY] == [shard.timeout_minutes for shard in SHARDS]
+        assert len(payload[MATRIX_SHARD_KEY]) == len(payload[MATRIX_TIMEOUT_KEY]) == len(SHARDS)
+
+    def test_matrix_is_a_single_line_of_json(self) -> None:
+        """边界：单行输出才能安全嵌进 ``$GITHUB_OUTPUT`` 的 ``$(...)`` 替换。"""
+        text = render_matrix(SHARDS)
+        assert "\n" not in text
+        assert text.startswith("{") and text.endswith("}")
+
+    def test_matrix_of_a_single_shard(self) -> None:
+        """正向：只选中一个分片时矩阵只有一个条目（本地调试形态）。"""
+        payload = json.loads(render_matrix(select_shards(["redis"])))
+        assert payload == {MATRIX_SHARD_KEY: ["redis"], MATRIX_TIMEOUT_KEY: [15]}
+
+    def test_matrix_without_shards_has_empty_arrays(self) -> None:
+        """边界：未选中分片时输出空数组而不是抛异常。"""
+        assert json.loads(render_matrix(())) == {MATRIX_SHARD_KEY: [], MATRIX_TIMEOUT_KEY: []}
+
+
 class TestCli:
     def test_default_format_is_table(self) -> None:
         """正向：未指定 ``--format`` 时默认输出表格。"""
@@ -304,7 +403,7 @@ class TestCli:
             build_parser().parse_args(["--format", "yaml"])
         assert excinfo.value.code == 2
 
-    @pytest.mark.parametrize("fmt", ["paths", "required", "compose", "init", "env"])
+    @pytest.mark.parametrize("fmt", ["paths", "required", "compose", "init", "env", "matrix"])
     def test_main_prints_the_requested_format(
         self, fmt: str, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -371,3 +470,21 @@ class TestCli:
         assert result.returncode == expected, result.stderr
         if expected == 0:
             assert result.stdout.strip() == "redis"
+
+    def test_module_entry_point_emits_matrix_json(self) -> None:
+        """正向：子进程级校验 ``--format matrix`` 输出可被 ``json.loads`` 消费。"""
+        env = {**os.environ, "PYTHONPATH": str(PROJECT_ROOT / "src")}
+        for key in list(env):
+            if key.startswith(ENV_PREFIX):
+                del env[key]
+        result = subprocess.run(
+            [sys.executable, "-m", SHARDS_MODULE, "--format", "matrix"],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=PROJECT_ROOT,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        assert payload[MATRIX_SHARD_KEY] == list(EXPECTED_SHARD_NAMES)

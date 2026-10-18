@@ -110,7 +110,7 @@ def passing_case(shard: str, *, time: str = "0.100") -> str:
 
 @pytest.fixture
 def all_green_reports(tmp_path: Path) -> Path:
-    """四个分片都齐备、且全部通过的报告目录。"""
+    """全部分片都齐备、且全部通过的报告目录。"""
     root = tmp_path / "reports"
     for name in shard_names():
         write_report(root, name, [passing_case(name)])
@@ -322,8 +322,9 @@ class TestRenderMarkdown:
         """正向：缺报告时结论行直接说明缺了几片（而不是显示「全部通过」）。"""
         write_report(tmp_path, "redis", [passing_case("redis")])
         markdown = render_markdown(build_aggregate(collect_shard_reports(tmp_path)))
-        assert "结果：**报告不齐（3/4 个分片缺报告）**" in markdown
-        assert "1/4 个分片有报告" in markdown
+        missing = len(shard_names()) - 1
+        assert f"结果：**报告不齐（{missing}/{len(shard_names())} 个分片缺报告）**" in markdown
+        assert f"1/{len(shard_names())} 个分片有报告" in markdown
 
     def test_headline_flags_failures(self) -> None:
         """正向：有失败用例时结论行标红。"""
@@ -465,7 +466,7 @@ class TestModuleEntryPoint:
     @pytest.mark.parametrize(
         ("shards_with_reports", "expected"),
         [
-            (("redis", "mysql", "elasticsearch", "redis-cluster"), EXIT_OK),
+            (shard_names(), EXIT_OK),
             (("redis",), EXIT_INCOMPLETE),
         ],
         ids=["all-green", "missing-reports"],
@@ -692,7 +693,7 @@ class TestAggregateTrend:
         """边界：基线只覆盖部分分片时对比仍可用，但必须显式标出「不齐」。
 
         真实场景是「上一轮有分片在 pytest 之前就挂了」：基线目录里只有 redis 的报告，
-        而期望的分片清单仍是完整的四片。
+        而期望的分片清单仍是完整的五片。
         """
         reports = all_green_reports_of(tmp_path)
         write_report(tmp_path / "old", "redis", [passing_case("redis")])
@@ -799,7 +800,10 @@ class TestComparisonRendering:
         baseline = build_aggregate(collect_shard_reports(tmp_path / "old"))
         markdown = render_markdown(current, baseline=baseline)
         assert "| `mysql` | 1/1 | — | — | — | 新增 |" in markdown
-        assert "⚠️ 基线只有 1/4 个分片有报告（缺：mysql, elasticsearch, redis-cluster）" in markdown
+        assert (
+            "⚠️ 基线只有 1/5 个分片有报告"
+            "（缺：mysql, elasticsearch, redis-cluster, redis-cluster-failover）" in markdown
+        )
 
     def test_new_failures_and_fixed_are_listed_with_shard_prefix(self) -> None:
         """正向：新增失败与已修复都带分片前缀，可直接定位到后端。"""
@@ -831,7 +835,7 @@ class TestComparisonRendering:
 
 
 def all_green_reports_of(root: Path) -> Path:
-    """在 ``root`` 下造一份「四个分片各一条通过用例」的报告目录。"""
+    """在 ``root`` 下造一份「五个分片各一条通过用例」的报告目录。"""
     reports = root / "reports"
     for name in shard_names():
         write_report(reports, name, [passing_case(name)])
@@ -896,7 +900,7 @@ class TestBaselineCli:
     def test_snapshot_dir_writes_the_canonical_baseline(
         self, all_green_reports: Path, tmp_path: Path
     ) -> None:
-        """正向：``--snapshot-dir`` 把四个分片的报告写进 ``baseline/<分片>/``。"""
+        """正向：``--snapshot-dir`` 把五个分片的报告写进 ``baseline/<分片>/``。"""
         target = tmp_path / BASELINE_LEDGER_DIR
         code = main(
             [
@@ -943,7 +947,10 @@ class TestBaselineCli:
             == EXIT_OK
         )
         out = capsys.readouterr().out
-        assert "基线报告齐备（4/4 个分片），通过率变化 **+0.00%**" in out
+        assert (
+            f"基线报告齐备（{len(shard_names())}/{len(shard_names())} 个分片），通过率变化 **+0.00%**"
+            in out
+        )
         assert "无（与基线相比没有新增失败用例）" in out
 
     def test_shard_selection_applies_to_the_baseline(
