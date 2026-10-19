@@ -23,6 +23,14 @@ JUnit 报告聚合成一份汇总（分片明细表 + 合计行 + 缺失报告�
   **逐分片变化**（失败数与通过率的变化 + 状态标记）以及跨分片的
   **新增失败 / 已修复**清单；``--snapshot-dir`` 把本轮报告按规范布局存一份，
   工作流用滚动缓存把它喂给下一轮，于是对比不需要任何外部存储；
+* **两套基线合一**（D47）：分片粒度的用例级趋势原先由各分片作业用
+  :mod:`med_langchain_memory.testing.trend` 的 CLI 各自维护——每个分片各滚一份
+  ``actions/cache`` 基线，缓存与口径都有两份。现在趋势整体上收汇总作业：
+  本模块的 :attr:`AggregateTrend.shard_trends` 用**同一份** ``baseline/`` 快照
+  逐分片构建 :class:`~med_langchain_memory.testing.trend.TrendReport`
+  （口径与 ``trend`` 逐字一致），于是整轮总账、逐分片状态与逐分片用例级趋势
+  共享一套滚动基线；``trend`` 的 CLI 保留给本地单报告场景，工作流不再按分片
+  缓存报告，也不再调用趋势 CLI；
 * 只做计数、排序与聚合，不读取、不处理任何测试输出文本内容。
 
 退出码（汇总作业的整轮结论）：
@@ -61,6 +69,8 @@ from .trend import (
     JUNIT_REPORT_NAME,
     CaseResult,
     SuiteReport,
+    TrendReport,
+    build_trend,
     parse_junit_report,
 )
 
@@ -373,6 +383,42 @@ class ShardDelta:
 
 
 @dataclass(frozen=True)
+class ShardTrend:
+    """单个分片相对其上一轮基线的用例级趋势。
+
+    口径与 :mod:`med_langchain_memory.testing.trend` 的 :class:`TrendReport`
+    完全一致（由 :func:`~med_langchain_memory.testing.trend.build_trend` 构建）：
+    D47 之前，分片粒度的用例级趋势由各分片作业用 ``trend`` CLI 各自维护
+    （每个分片各滚一份 ``actions/cache`` 基线）；现在两套基线合一——汇总作业
+    用同一份 ``baseline/`` 快照逐分片重建趋势，缓存与口径都只有一处。
+    """
+
+    #: 分片名。
+    name: str
+
+    #: 人类可读的分片标题。
+    title: str
+
+    #: 该分片「本轮 vs 基线」的趋势（两侧报告均由调用方保证存在）。
+    trend: TrendReport
+
+    @property
+    def new_failures(self) -> tuple[CaseResult, ...]:
+        """本轮失败、基线未失败的用例。"""
+        return self.trend.new_failures
+
+    @property
+    def fixed(self) -> tuple[CaseResult, ...]:
+        """基线失败、本轮不再失败的用例。"""
+        return self.trend.fixed
+
+    @property
+    def pass_rate_delta(self) -> float:
+        """通过率的变化（本轮 - 基线，保留 4 位）。"""
+        return self.trend.pass_rate_delta
+
+
+@dataclass(frozen=True)
 class AggregateTrend:
     """整轮总账相对上一轮基线的对比结果。
 
@@ -383,6 +429,10 @@ class AggregateTrend:
     基线不齐（上一轮有分片在 pytest 之前就挂了，没产出 JUnit）时对比**仍然可用**，
     只是只覆盖有报告的那些分片；此时 :attr:`baseline_complete` 为 ``False``，
     渲染出的对比小节会显式列出缺哪几片，避免把「少了一片」误读成「用例变少了」。
+
+    分片粒度的**用例级**趋势（新增失败 / 已修复 / 通过率变化）见
+    :attr:`shard_trends`：它与 :attr:`shards` 的状态表、跨分片清单共用同一份基线，
+    口径与 :mod:`med_langchain_memory.testing.trend` 逐字一致。
     """
 
     #: 本轮总账。
@@ -419,6 +469,32 @@ class AggregateTrend:
             )
             for status in self.current.statuses
         )
+
+    @property
+    def shard_trends(self) -> tuple[ShardTrend, ...]:
+        """逐分片用例级趋势（口径复用 :func:`trend.build_trend`）。
+
+        只覆盖**本轮与基线都有报告**的分片；任一侧缺报告时该片不出现在这里
+        （缺报告的事实由 :attr:`shards` 的状态表表达）。无可用基线时为空元组。
+        """
+        baseline = self.baseline
+        if baseline is None or not baseline.reports:
+            return ()
+        known = {status.name: status.report for status in baseline.statuses}
+        trends: list[ShardTrend] = []
+        for status in self.current.statuses:
+            report = status.report
+            base = known.get(status.name)
+            if report is None or base is None:
+                continue
+            trends.append(
+                ShardTrend(
+                    name=status.name,
+                    title=status.title,
+                    trend=build_trend(report, base),
+                )
+            )
+        return tuple(trends)
 
     @property
     def new_failures(self) -> tuple[tuple[str, CaseResult], ...]:
@@ -565,6 +641,22 @@ def _delta_row(delta: ShardDelta) -> str:
     )
 
 
+def _shard_trend_section(shard_trends: Sequence[ShardTrend]) -> list[str]:
+    """渲染逐分片用例级趋势小节；无可比较分片时返回空列表（小节整体不出现）。"""
+    if not shard_trends:
+        return []
+    lines = ["### 逐分片趋势（与上一轮的自己相比）", ""]
+    for shard in shard_trends:
+        lines.append(
+            f"- `{shard.name}` · 通过率 {shard.pass_rate_delta:+.2%} · "
+            f"新增失败 {len(shard.new_failures)} · 已修复 {len(shard.fixed)}"
+        )
+        lines.extend(f"  - 新增：`{case.node_id}`" for case in shard.new_failures)
+        lines.extend(f"  - 修复：`{case.node_id}`" for case in shard.fixed)
+    lines.append("")
+    return lines
+
+
 def _comparison_section(trend: AggregateTrend) -> list[str]:
     """渲染「与上一轮对比」小节；无可用基线时返回空列表（首次运行不出现该小节）。"""
     baseline = trend.baseline
@@ -607,6 +699,7 @@ def _comparison_section(trend: AggregateTrend) -> list[str]:
     ]
     lines.extend(_delta_row(delta) for delta in trend.shards)
     lines.append("")
+    lines += _shard_trend_section(trend.shard_trends)
     lines += _section(
         "本轮新增失败",
         _case_lines(trend.new_failures, with_duration=False),

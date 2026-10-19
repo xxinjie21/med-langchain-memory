@@ -20,9 +20,11 @@ name: Integration
 # 汇总作业：五个分片跑完后由 `aggregate` 作业把五份 JUnit 报告聚合成一份总账
 # （分片明细 + 合计 + 缺失报告 + 失败用例）贴进 Job Summary，并用单一退出码
 # 给出整轮结论——不必点开五个作业才知道今晚绿没绿。
-# 总账本身还会与**上一轮总账**对比（用例数 / 失败数 / 通过率 / 耗时的变化 +
-# 逐分片状态 + 跨分片的新增失败与已修复）：上一轮的报告由本作业末尾的快照
-# 写进 `baseline/`，靠滚动缓存传给下一次运行，不需要任何外部存储。
+# 总账本身还会与**上一轮总账**对比：整轮合计的变化、逐分片状态、跨分片的新增
+# 失败与已修复，以及**逐分片用例级趋势**（D47 两套基线合一——分片粒度的趋势
+# 原先由各分片作业用 trend CLI 各自维护、各滚一份缓存，现在统一上收本作业，
+# 整轮与分片粒度共享同一份基线）。上一轮的报告由本作业末尾的快照写进
+# `baseline/`，靠滚动缓存传给下一次运行，不需要任何外部存储。
 on:
   workflow_dispatch:
   schedule:
@@ -88,24 +90,6 @@ jobs:
       - name: Resolve shard environment
         run: python -m med_langchain_memory.testing.shards --shard "${{ matrix.shard }}" --format env >> "$GITHUB_ENV"
 
-      # 滚动缓存：key 带 run_id 保证每次都写新条目，restore-keys 前缀命中同一分片的上一次。
-      # 缓存内容是该分片自己的 reports/<shard>/ 目录。
-      - name: Restore previous JUnit report
-        uses: actions/cache@v4
-        with:
-          path: reports/${{ matrix.shard }}
-          key: integration-report-${{ matrix.shard }}-${{ github.run_id }}
-          restore-keys: |
-            integration-report-${{ matrix.shard }}-
-
-      - name: Keep restored report as baseline
-        run: |
-          mkdir -p "reports/${{ matrix.shard }}"
-          if [ -f "reports/${{ matrix.shard }}/integration.xml" ]; then
-            mv "reports/${{ matrix.shard }}/integration.xml" \
-               "reports/${{ matrix.shard }}/previous.xml"
-          fi
-
       # 只拉起本分片需要的容器，并等健康检查通过。
       - name: Start shard services
         run: |
@@ -131,16 +115,8 @@ jobs:
             --junit-xml="reports/${{ matrix.shard }}/integration.xml" \
             $(python -m med_langchain_memory.testing.shards --shard "${{ matrix.shard }}" --format paths)
 
-      # 无论用例成败都出摘要：pytest 已把失败写进 JUnit，这一步只负责可读化。
-      - name: Publish trend summary
-        if: always()
-        run: |
-          python -m med_langchain_memory.testing.trend \
-            "reports/${{ matrix.shard }}/integration.xml" \
-            --baseline "reports/${{ matrix.shard }}/previous.xml" \
-            --output "reports/${{ matrix.shard }}/integration-trend.md"
-          cat "reports/${{ matrix.shard }}/integration-trend.md" >> "$GITHUB_STEP_SUMMARY"
-
+      # 无论用例成败都上传报告：pytest 已把失败写进 JUnit，汇总作业据此出总账与
+      # 逐分片趋势（D47 起趋势与基线统一上收 aggregate 作业，分片不再各自渲染）。
       - name: Upload integration report
         if: always()
         uses: actions/upload-artifact@v4

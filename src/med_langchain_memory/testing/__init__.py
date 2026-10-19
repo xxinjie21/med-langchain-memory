@@ -8,8 +8,8 @@
 :mod:`med_langchain_memory.testing.trend`（JUnit 报告汇总与趋势对比）、
 :mod:`med_langchain_memory.testing.preflight`（CI 前置守卫：必需服务不可用即失败）、
 :mod:`med_langchain_memory.testing.shards`（集成套件按服务分片：并行作业的单一真值来源）与
-:mod:`med_langchain_memory.testing.aggregate`（分片结果聚合：四个分片合成一份总账、
-与上一轮基线对比、给出单一退出码）。
+:mod:`med_langchain_memory.testing.aggregate`（分片结果聚合：分片报告合成一份总账、
+与上一轮基线对比（含逐分片用例级趋势 :class:`ShardTrend`）、给出单一退出码）。
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from .aggregate import (
     ShardDelta,
     ShardDeltaState,
     ShardStatus,
+    ShardTrend,
     build_aggregate,
     build_aggregate_trend,
     collect_shard_reports,
@@ -175,6 +176,7 @@ __all__ = [
     "ShardDelta",
     "ShardDeltaState",
     "ShardStatus",
+    "ShardTrend",
     "SuiteReport",
     "TrendReport",
     "build_aggregate",

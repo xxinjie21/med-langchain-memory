@@ -23,8 +23,11 @@ These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
   broken environment fails the run instead of silently skipping every case;
 * the Redis Cluster announce IP must be pinned to the compose subnet gateway
   (Linux runners) and every container must be torn down afterwards;
-* each shard must emit its own JUnit report, render a Markdown trend summary into
-  ``$GITHUB_STEP_SUMMARY`` and roll the report forward through a **per-shard** cache;
+* each shard must emit its own JUnit report and upload it as an artifact; since
+  D47 the per-shard trend summary and the per-shard baseline cache are gone —
+  the ``aggregate`` job renders both the ledger comparison and the shard-level
+  trend (new failures / fixed per shard) from the **single** rolling ledger
+  baseline, so the whole nightly run keeps exactly one cached baseline;
 * the ``aggregate`` job must depend on the matrix job, run ``if: always()``, download
   every shard report through the real ``ARTIFACT_PREFIX``, aggregate with the real CLI
   options and publish the combined summary even when the aggregation step itself fails;
@@ -38,6 +41,7 @@ These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
 import shlex
@@ -73,12 +77,7 @@ from med_langchain_memory.testing.aggregate import (
 )
 from med_langchain_memory.testing.preflight import build_parser as build_preflight_parser
 from med_langchain_memory.testing.shards import build_parser as build_shards_parser
-from med_langchain_memory.testing.trend import (
-    BASELINE_REPORT_NAME,
-    JUNIT_REPORT_NAME,
-    TREND_SUMMARY_NAME,
-    build_parser,
-)
+from med_langchain_memory.testing.trend import JUNIT_REPORT_NAME
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "integration.yml"
@@ -93,7 +92,7 @@ USES_PATTERN = re.compile(r"uses:\s*(\S+)")
 #: 允许的动作引用形态：``owner/repo@v<major>``。
 PINNED_ACTION_PATTERN = re.compile(r"[\w.-]+/[\w.-]+@v\d+$")
 
-#: 渲染趋势摘要的模块入口（与 ``testing/trend.py`` 的 CLI 对齐）。
+#: 分片趋势渲染模块（D47 起工作流不再调用它；本地单报告场景仍可用）。
 TREND_MODULE = "med_langchain_memory.testing.trend"
 
 #: 前置守卫的模块入口（与 ``testing/preflight.py`` 的 CLI 对齐）。
@@ -119,11 +118,6 @@ AGGREGATE_REPORTS_DIR = "reports"
 
 #: 汇总作业滚动总账基线的缓存键前缀（与工作流里的 ``key:`` / ``restore-keys:`` 一致）。
 BASELINE_CACHE_PREFIX = "integration-baseline-"
-
-#: ``python -m <module> ...`` 调用整段（含续行），用于交叉校验 CLI 选项。
-TREND_INVOCATION_PATTERN = re.compile(
-    rf"python -m {re.escape(TREND_MODULE)}(?P<args>(?:[^\n]*\\\n)*[^\n]*)"
-)
 
 #: 聚合 CLI 的调用整段（工作流里同样用 ``\`` 续行）。
 AGGREGATE_INVOCATION_PATTERN = re.compile(
@@ -151,18 +145,6 @@ def read_workflow() -> str:
 def rendered_workflow(shard: str = SAMPLE_SHARD) -> str:
     """Return the workflow text with the matrix expression replaced by a literal shard."""
     return read_workflow().replace(SHARD_EXPRESSION, shard)
-
-
-def trend_arguments() -> list[str]:
-    """Return the CLI tokens passed to the trend module inside the workflow.
-
-    The workflow spreads the invocation over several ``\\``-continued lines and
-    quotes the shard-scoped paths, so both the continuations and the quoting are
-    normalised away with ``shlex`` before the real parser sees the tokens.
-    """
-    match = TREND_INVOCATION_PATTERN.search(rendered_workflow())
-    assert match is not None, f"{TREND_MODULE} is never invoked by the workflow"
-    return shlex.split(match.group("args").replace("\\\n", " "))
 
 
 def shards_invocations() -> list[str]:
@@ -457,59 +439,56 @@ class TestRedisClusterShard:
 
 
 class TestTrendReporting:
-    """每个分片独立产出可读摘要，并把报告滚动给同一分片的下一次运行做对比。"""
+    """分片报告的上传与趋势上收（D47：趋势与基线上收汇总作业，只留一套滚动基线）。"""
 
     def test_pytest_emits_junit_report_per_shard(self) -> None:
-        """正向：pytest 把结果写进分片自己的 JUnit XML（摘要与缓存的输入）。"""
+        """正向：pytest 把结果写进分片自己的 JUnit XML（汇总与逐分片趋势的唯一输入）。"""
         assert f'--junit-xml="{SHARD_REPORT_DIR}/{JUNIT_REPORT_NAME}"' in read_workflow()
 
-    def test_renders_summary_into_step_summary(self) -> None:
-        """正向：摘要渲染成 Markdown 并追加进 ``$GITHUB_STEP_SUMMARY``。"""
-        text = read_workflow()
-        assert f'--output "{SHARD_REPORT_DIR}/{TREND_SUMMARY_NAME}"' in text
-        assert f'cat "{SHARD_REPORT_DIR}/{TREND_SUMMARY_NAME}" >> "$GITHUB_STEP_SUMMARY"' in text
-
-    def test_summary_step_runs_even_when_tests_fail(self) -> None:
-        """边界：用例失败时仍要出摘要（失败信息正是最需要被看到的）。"""
-        step = re.search(
-            r"- name: Publish trend summary\n(?P<body>.*?)(?=\n\s*- name:|\Z)",
-            read_workflow(),
-            re.DOTALL,
-        )
-        assert step is not None, "Publish trend summary step is missing"
-        assert re.search(r"if:\s*always\(\)", step.group("body"))
-
-    def test_rolls_report_forward_through_a_per_shard_cache(self) -> None:
-        """正向：缓存按分片隔离，恢复出来的报告被改名为基线。"""
-        text = read_workflow()
-        assert "actions/cache@v4" in text
-        assert f"path: {SHARD_REPORT_DIR}" in text
-        assert f"key: integration-report-{SHARD_EXPRESSION}-${{{{ github.run_id }}}}" in text
-        assert re.search(r"restore-keys:\s*\|", text)
-        assert f'mv "{SHARD_REPORT_DIR}/{JUNIT_REPORT_NAME}"' in text
-        assert f'"{SHARD_REPORT_DIR}/{BASELINE_REPORT_NAME}"' in text
-
     def test_uploads_report_as_artifact_per_shard(self) -> None:
-        """正向：报告目录按分片作为 artifact 上传，便于事后排查。"""
+        """正向：报告目录按分片作为 artifact 上传，供汇总作业下载。"""
         text = read_workflow()
         assert "actions/upload-artifact@v4" in text
         assert f"name: integration-report-{SHARD_EXPRESSION}" in text
         assert re.search(rf"path:\s*{re.escape(SHARD_REPORT_DIR)}/\s*$", text, re.MULTILINE)
 
-    def test_trend_cli_flags_exist_in_the_real_parser(self) -> None:
-        """边界：工作流传给 trend CLI 的每个长选项都必须真实存在。"""
-        known = {option for action in build_parser()._actions for option in action.option_strings}
-        flags = [token for token in trend_arguments() if token.startswith("--")]
-        assert flags, "workflow must pass options to the trend module"
-        unknown = [flag for flag in flags if flag not in known]
-        assert unknown == [], f"workflow references unknown trend options: {unknown}"
+    def test_upload_step_runs_even_when_tests_fail(self) -> None:
+        """边界：用例失败也要上传报告（失败信息正是汇总作业最需要的输入）。"""
+        body = step_body("Upload integration report")
+        assert re.search(r"if:\s*always\(\)", body)
 
-    def test_trend_arguments_are_parseable(self) -> None:
-        """边界：工作流里那段命令行必须能被真实解析器解析通过。"""
-        parsed = build_parser().parse_args(trend_arguments())
-        assert parsed.report == Path("reports") / SAMPLE_SHARD / JUNIT_REPORT_NAME
-        assert parsed.baseline == Path("reports") / SAMPLE_SHARD / BASELINE_REPORT_NAME
-        assert parsed.output == Path("reports") / SAMPLE_SHARD / TREND_SUMMARY_NAME
+    def test_shard_job_no_longer_renders_a_trend_summary(self) -> None:
+        """正向（D47）：分片作业不再调用 trend CLI，也不再渲染分片级 Markdown 摘要。"""
+        text = read_workflow()
+        assert TREND_MODULE not in text
+        assert "integration-trend.md" not in text
+
+    def test_shard_job_keeps_no_baseline_of_its_own(self) -> None:
+        """边界（D47）：分片作业不再滚动自己的报告缓存，也没有 baseline 改名步骤。"""
+        integration = job_body("integration")
+        assert "key:" not in integration
+        assert "actions/cache" not in integration
+        assert "previous.xml" not in read_workflow()
+
+    def test_only_one_rolling_cache_remains_for_the_whole_run(self) -> None:
+        """边界（D47）：整套夜间报告只保留汇总作业的一份基线缓存（两套基线合一）。"""
+        text = read_workflow()
+        assert text.count("uses: actions/cache@") == 1
+        aggregate = aggregate_job_body()
+        assert "uses: actions/cache@v4" in aggregate
+        assert f"path: {BASELINE_LEDGER_DIR}" in aggregate
+
+    def test_trend_cli_module_still_importable_for_local_use(self) -> None:
+        """正对照（D47）：trend 模块与 CLI 仍保留（本地单报告场景可用，只是工作流不调用）。"""
+        module = importlib.import_module(TREND_MODULE)
+        assert callable(module.build_trend)
+        assert callable(module.main)
+
+    def test_readme_documents_the_shard_level_trend(self) -> None:
+        """正向（D47）：README 必须说明逐分片趋势由汇总作业渲染（否则没人知道去哪看）。"""
+        readme = README_PATH.read_text(encoding="utf-8")
+        assert "逐分片趋势" in readme
+        assert AGGREGATE_MODULE in readme
 
 
 class TestAggregateJob:

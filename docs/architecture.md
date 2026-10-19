@@ -73,7 +73,7 @@ LLM 本身无状态，对话的「记忆」必须由外部存储承担。本库�
 │  ├─ trend.py     JUnit 报告汇总 + 趋势对比 + Markdown 渲染             │
 │  ├─ preflight.py 必需服务前置守卫：不可达即失败（防「集体跳过」假绿灯）│
 │  ├─ shards.py    集成套件按服务分片：用例路径/服务/compose 名/环境变量的单一真值源│
-│  └─ aggregate.py 分片结果聚合：四片合成总账 + 与上一轮基线对比 + 结论退出码 │
+│  └─ aggregate.py 分片结果聚合：五片总账 + 基线对比（含逐分片趋势）+ 结论退出码    │
 ├──────────────────────────────────────────────────────────────────────┤
 │  serde/          序列化层：Serializer 抽象 + ProtobufSerializer          │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -510,6 +510,41 @@ key 带 `run_id`、`restore-keys` 前缀命中上一次），由汇总作业自�
 
 ---
 
+### ADR-19 · 两套基线合一：分片粒度的用例级趋势上收汇总作业
+
+**决策**：撤销 D41「每个分片各自用 `trend` CLI 渲染趋势、各自滚动一份
+`actions/cache` 基线」的形态，改为**一套基线、一个渲染点**——汇总作业用同一份
+`baseline/` 快照同时渲染整轮总账对比（ADR-17）与**逐分片用例级趋势**：
+`testing/aggregate.py` 的 `ShardTrend` / `AggregateTrend.shard_trends` 对两侧
+都有报告的分片逐片调用 `trend.build_trend`（口径与 `trend` CLI 逐字一致），
+渲染进「与上一轮对比」小节的「逐分片趋势」小节。`trend` 的 CLI 保留给本地
+单报告场景，工作流不再调用它。
+
+| 关注点 | 实现 | 为什么这样切 |
+|---|---|---|
+| 缓存份数 | 工作流只剩汇总作业一份 `actions/cache`（`path: baseline`） | 分片作业是并行矩阵，各自缓存 = 缓存翻倍且口径可能漂移；而分片要的基线数据本来就在汇总作业手里 |
+| 口径一致性 | 分片趋势直接复用 `trend.build_trend`，不重写集合差 | 「新增失败 / 已修复」的判定规则只有一处实现，离线单测正对照钉死 |
+| 覆盖范围 | 只覆盖本轮与基线**都有报告**的分片 | 任一侧缺报告由 `ShardDelta` 状态表表达（`⚠️ 缺报告`），趋势行不伪造 0 数据 |
+| 退场路径 | `trend` 模块与 CLI 原样保留 | 本地单跑一份报告时它仍是最短路径；删除反而要动包根导出与文档 |
+
+**理由**：
+
+* 两份缓存 = 两份真相：分片缓存按 `run_id` 滚动、汇总缓存也按 `run_id` 滚动，
+  任何一边缓存未命中时两侧的「趋势」表现不一致（分片无对比、总账有对比），
+  读摘要的人要靠「这行趋势是哪来的」脑内归因；
+* 汇总作业天然持有全量数据：它下载五个分片的 artifact，逐分片趋势需要的信息
+  （本轮的 `reports/<分片>/` + 上一轮的 `baseline/<分片>/`）**已经在同一台 runner 上**，
+  上收不增加任何新的数据搬运，只是把渲染从五个作业挪到最后一个；
+* 缓存条目数从「五分片 + 一基线」降为「一基线」，`actions/cache` 的 10 GB
+  租户限制与 nightly 清理压力同步下降。
+
+**代价**：分片作业的 Job Summary 不再有「自己 vs 自己」的趋势段，需要看趋势的
+人改看汇总作业的总账（信息没有丢，只是位置变了）；若未来某分片想在自己作业内
+即时看到变化，需要重新引入分片级基线——届时应以「汇总作业把上一轮分片摘要
+写回 artifact」的方式回填，而不是恢复第二套缓存。
+
+---
+
 ## 5. 并发与可用性
 
 | 机制 | 实现 | 降级路径 |
@@ -564,9 +599,9 @@ key 带 `run_id`、`restore-keys` 前缀命中上一次），由汇总作业自�
 | 集成环境编排 | `docker-compose.integration.yml`（Redis / MySQL / ES 带健康检查 + Redis Cluster 三主三从 6 节点 + 一次性初始化容器）；可选工作流 `.github/workflows/integration.yml`（手动 + 每日夜间），跑用例前先过前置守卫 |
 | 分片并行 | `testing/shards.py` 把真机套件按服务切成五个矩阵分片（`redis` / `mysql` / `elasticsearch` / `redis-cluster` / `redis-cluster-failover`），每个分片只拉起自己的容器；分片表是单一真值来源，工作流不硬编码任何服务地址 / 分片名 / 容器名 / 分片数量（连矩阵 JSON 都由 `plan` 作业的 `--format matrix` 生成，ADR-18）；每个分片声明自己的 `timeout_minutes` 墙钟预算；离线单测在 `tests/test_integration/test_shards.py` |
 | 假绿灯防护 | `testing/preflight.py` 按 `MED_MEMORY_IT_REQUIRED` 逐个探针，任一必需服务不可用即退出码 1——否则「用例集体 skip」会让环境故障伪装成通过；离线单测在 `tests/test_integration/test_preflight.py` |
-| 夜间趋势上报 | `testing/trend.py` 解析 JUnit 报告渲染 Markdown 摘要写入 Job Summary，报告经 `actions/cache` **按分片**滚动为下次基线；离线单测在 `tests/test_integration/test_trend.py` |
+| 趋势上报 | `testing/trend.py` 解析 JUnit 报告渲染 Markdown 摘要，是本地单报告场景的入口（CLI 保留）；夜间工作流的趋势自 D47 起统一由汇总作业渲染（见下一行），离线单测在 `tests/test_integration/test_trend.py` |
 | 分片结果聚合 | `testing/aggregate.py` 把五个分片的报告聚合成一份总账（分片明细 + 合计 + 缺失报告 + 失败用例 + 最慢用例）写入 Job Summary，并以退出码 `0/1/2/3` 区分「齐备无失败 / 缺报告 / 有失败 / 参数非法」；离线单测在 `tests/test_integration/test_aggregate.py` |
-| 总账基线对比 | 同一模块的 `AggregateTrend` / `build_aggregate_trend` 拿 `--baseline-dir` 的上一轮报告算出整轮合计变化、逐分片状态与跨分片的新增失败 / 已修复；`--snapshot-dir` 把本轮报告写进 `baseline/` 由 `actions/cache` 滚动给下一轮；无基线时该小节整体消失（纯增量）；离线单测同上，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestAggregateBaseline` |
+| 总账基线对比 | 同一模块的 `AggregateTrend` / `build_aggregate_trend` 拿 `--baseline-dir` 的上一轮报告算出整轮合计变化、逐分片状态、跨分片的新增失败 / 已修复，以及**逐分片用例级趋势**（`ShardTrend` / `shard_trends`，口径复用 `trend.build_trend`，即 ADR-19 的「两套基线合一」）；`--snapshot-dir` 把本轮报告写进 `baseline/`，由汇总作业唯一的 `actions/cache` 滚动给下一轮；无基线时对比小节整体消失（纯增量）；离线单测同上，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestAggregateBaseline` 与 `TestTrendReporting` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |

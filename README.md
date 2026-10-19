@@ -261,7 +261,7 @@ docker compose -f docker-compose.integration.yml down -v
 | 地址覆盖 | `MED_MEMORY_IT_REDIS_URL` / `MED_MEMORY_IT_MYSQL_URL` / `MED_MEMORY_IT_ELASTICSEARCH_URL` / `MED_MEMORY_IT_REDIS_CLUSTER_URL` |
 | 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引、hash tag 同 slot、集群 pipeline 语义、集群故障转移） |
 | MySQL 前置 | DBAPI 驱动 `pymysql` 随 `[mysql]` / `[dev]` extras 一起装，缺失时 MySQL 用例跳过 |
-| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；按服务**分片并行**，跑之前先过分片前置守卫，每个分片各自产出趋势摘要并滚动缓存报告供下次对比，最后由汇总作业把五份报告合成一份总账（见下） |
+| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；按服务**分片并行**，跑之前先过分片前置守卫，五个分片只产出各自的 JUnit 报告，趋势与总账统一由汇总作业基于**同一份滚动基线**渲染（见下） |
 
 探针与开关逻辑在 `med_langchain_memory/testing/services.py`，只用标准库，
 因此「能不能跑」的判断本身不依赖任何中间件客户端。
@@ -343,15 +343,18 @@ docker compose -f docker-compose.integration.yml down -v
 | 服务 | `docker compose -f docker-compose.integration.yml up -d --wait <本分片服务>`：中间件统一走 compose（`services:` 无法按矩阵分片），`--wait` 等健康检查通过；集群分片再多一步 `run --rm redis-cluster-init` |
 | 环境 | `python -m med_langchain_memory.testing.shards --shard <分片> --format env >> "$GITHUB_ENV"`：总开关、本分片必需服务清单与地址全部由模块给出 |
 | 守卫 | `python -m med_langchain_memory.testing.preflight` 在用例之前跑：本分片的必需服务任一不可用即整步失败（见上） |
-| 报告 | `pytest -m integration --junit-xml=reports/<分片>/integration.xml`，失败也照常出报告 |
-| 摘要 | `python -m med_langchain_memory.testing.trend reports/<分片>/integration.xml --baseline reports/<分片>/previous.xml` 渲染 Markdown 写进 Job Summary（用例数 / 通过率 / **新增失败** / **已修复** / 最慢用例） |
-| 滚动 | `reports/<分片>/` 走 `actions/cache`，key 带分片名与 `run_id`、`restore-keys` 前缀命中**同一分片**的上一次；恢复出的报告改名 `previous.xml` 作为本次基线 |
+| 报告 | `pytest -m integration --junit-xml=reports/<分片>/integration.xml`，失败也照常出报告，随后按分片上传为 artifact 供汇总作业下载 |
 
 `fail-fast: false`：一个分片红不代表其它分片没有价值，五个分片各自出结论。
 
-趋势渲染逻辑在 `med_langchain_memory/testing/trend.py`，**纯标准库**
-（`xml.etree.ElementTree`），汇总口径一律从 `<testcase>` 子节点推导，
-不信任 `<testsuite>` 上的 `tests=` / `failures=` 属性。本地可直接复现：
+汇总与趋势口径在 `med_langchain_memory/testing/trend.py` 与 `testing/aggregate.py`，
+**纯标准库**（`xml.etree.ElementTree`），汇总口径一律从 `<testcase>` 子节点推导，
+不信任 `<testsuite>` 上的 `tests=` / `failures=` 属性。
+
+**两套基线合一（D47）**：分片粒度的用例级趋势（新增失败 / 已修复 / 通过率变化）
+原先由各分片作业用 trend CLI 各自维护、各滚一份缓存；现在趋势整体上收汇总作业
+的总账对比小节，与整轮趋势共享**同一份** `baseline/` 滚动基线——整套夜间报告只有
+一份缓存、一套口径。trend CLI 本身保留，本地单报告仍可直接复现：
 
 ```bash
 MED_MEMORY_IT=1 pytest -m integration --junit-xml=reports/redis/integration.xml
@@ -370,7 +373,7 @@ python -m med_langchain_memory.testing.trend reports/redis/integration.xml --out
 |---|---|
 | 分片明细表 | 每个分片一行：用例数 / 通过 / 失败 / 跳过 / 通过率 / 耗时；缺报告的分片标 `⚠️ 无报告`，不伪造 0 数据 |
 | 合计行 | 只统计已解析的报告，通过率分母排除跳过用例 |
-| 与上一轮对比 | 整轮合计的**用例数 / 通过 / 失败 / 跳过 / 通过率 / 耗时**变化 + 逐分片状态表（`持平` / `✅ 改善` / `⚠️ 回退` / `新增` / `⚠️ 缺报告`）+ 跨分片的**本轮新增失败 / 已修复**清单 |
+| 与上一轮对比 | 整轮合计的**用例数 / 通过 / 失败 / 跳过 / 通过率 / 耗时**变化 + 逐分片状态表（`持平` / `✅ 改善` / `⚠️ 回退` / `新增` / `⚠️ 缺报告`）+ **逐分片趋势**（每片的用例级新增失败 / 已修复 / 通过率变化，口径与 trend CLI 一致）+ 跨分片的**本轮新增失败 / 已修复**清单 |
 | 缺失报告 | 逐片列出原因与期望路径（`reports/<分片>/integration.xml`） |
 | 失败用例 | 跨分片清单，带 `分片 · classname::name` 前缀，同名用例不会混淆 |
 | 最慢用例 | 跨分片排序的前 N 条（`--slowest`，默认 5） |
@@ -393,9 +396,11 @@ python -m med_langchain_memory.testing.aggregate --reports-dir reports \
 `run_id`、`restore-keys` 前缀命中上一次）恢复上一轮的分片报告；聚合时 `--baseline-dir baseline`
 据此渲染对比小节，`--snapshot-dir baseline` 把本轮报告按规范布局
 `baseline/<分片>/integration.xml` 存一份，随缓存滚动给下一次运行。于是整轮对比
-**不需要任何外部存储**；首次运行（缓存未命中）时对比小节不出现，与单分片趋势
-「基线列显示 `—`」是同一套语义。基线本身不齐（上一轮有分片在 pytest 之前就挂了）时
-对比仍然可用，但会显式列出缺哪几片，避免把「少了一片」误读成「用例变少了」。
+**不需要任何外部存储**；首次运行（缓存未命中）时对比小节不出现。
+D47 起**两套基线合一**：逐分片的用例级趋势（新增失败 / 已修复）也由这份同一基线
+渲染，分片作业不再各自滚动缓存——整套夜间报告一份缓存、一套口径。基线本身不齐
+（上一轮有分片在 pytest 之前就挂了）时对比仍然可用，但会显式列出缺哪几片，
+避免把「少了一片」误读成「用例变少了」。
 
 | 退出码 | 含义 |
 |---|---|
@@ -497,7 +502,7 @@ python -m med_langchain_memory.release --dist dist --expected-version v0.1.0   #
 
 ## 每日迭代节奏
 
-项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行、D44 分片结果聚合汇总作业、D45 汇总总账与上一轮基线对比）。
+项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行、D44 分片结果聚合汇总作业、D45 汇总总账与上一轮基线对比、D46 故障转移演练独立分片与超时预算、D47 两套基线合一：分片粒度趋势上收汇总作业）。
 
 ---
 

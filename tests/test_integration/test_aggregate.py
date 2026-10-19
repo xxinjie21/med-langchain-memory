@@ -1,4 +1,4 @@
-"""``med_langchain_memory.testing.aggregate`` 的离线单测（D44 聚合 + D45 总账基线对比）。
+"""``med_langchain_memory.testing.aggregate`` 的离线单测（D44 聚合 + D45 总账基线 + D47 逐分片趋势）。
 
 全部用例只依赖标准库与合成 JUnit XML，**不需要任何真实中间件、Docker 或网络**，
 因此这些用例在默认 ``pytest`` 下就会执行（不带 ``integration`` 标记）。
@@ -26,6 +26,7 @@ from med_langchain_memory.testing.aggregate import (
     AggregateTrend,
     ShardDelta,
     ShardStatus,
+    ShardTrend,
     build_aggregate,
     build_aggregate_trend,
     build_parser,
@@ -36,7 +37,7 @@ from med_langchain_memory.testing.aggregate import (
     snapshot_reports,
 )
 from med_langchain_memory.testing.shards import shard_names
-from med_langchain_memory.testing.trend import JUNIT_REPORT_NAME, parse_junit_xml
+from med_langchain_memory.testing.trend import JUNIT_REPORT_NAME, build_trend, parse_junit_xml
 
 #: 聚合模块的模块路径（子进程用例用它与真实 CLI 对齐）。
 AGGREGATE_MODULE = "med_langchain_memory.testing.aggregate"
@@ -765,8 +766,96 @@ class TestAggregateTrend:
         assert trend.fixed == ()
 
 
+class TestShardTrend:
+    """分片趋势外壳：转发 trend 口径的用例级清单（D47 两套基线合一）。"""
+
+    @staticmethod
+    def make_shard_trend() -> ShardTrend:
+        """构造一个 redis 分片趋势：本轮 b 失败、基线 a 失败（互相置换）。"""
+        current = parse_junit_xml(
+            make_junit(
+                [
+                    make_case("c", "a"),
+                    make_case("c", "b", kind="failure"),
+                ]
+            )
+        )
+        baseline = parse_junit_xml(
+            make_junit(
+                [
+                    make_case("c", "a", kind="failure"),
+                    make_case("c", "b"),
+                ]
+            )
+        )
+        return ShardTrend(
+            name="redis",
+            title="Redis single node",
+            trend=build_trend(current, baseline),
+        )
+
+    def test_forwards_new_failures_and_fixed(self) -> None:
+        """正向：新增失败与已修复按 trend 口径原样转发。"""
+        shard = self.make_shard_trend()
+        assert tuple(case.node_id for case in shard.new_failures) == ("c::b",)
+        assert tuple(case.node_id for case in shard.fixed) == ("c::a",)
+
+    def test_forwards_pass_rate_delta(self) -> None:
+        """正向：通过率变化直接转发 trend 的结论。"""
+        shard = self.make_shard_trend()
+        assert shard.pass_rate_delta == 0.0
+
+
+class TestShardTrends:
+    """AggregateTrend.shard_trends：同一份基线同时服务整轮与分片粒度。"""
+
+    def test_covers_every_comparable_shard_in_table_order(self, all_green_reports: Path) -> None:
+        """正向：本轮与基线都齐备的分片各出一条趋势，顺序与标题跟随分片表。"""
+        current = build_aggregate(collect_shard_reports(all_green_reports))
+        baseline = build_aggregate(collect_shard_reports(all_green_reports))
+        trends = build_aggregate_trend(current, baseline).shard_trends
+        assert tuple(shard.name for shard in trends) == shard_names()
+        assert tuple(shard.title for shard in trends) == tuple(
+            status.title for status in current.statuses
+        )
+
+    def test_matches_the_trend_module_result_case_by_case(self) -> None:
+        """正对照：分片趋势的用例级口径与 ``trend.build_trend`` 逐字一致（不重新发明）。"""
+        current = aggregate_of({"redis": [("a", ""), ("b", "failure")]})
+        baseline = aggregate_of({"redis": [("a", "failure"), ("b", "")]})
+        trends = build_aggregate_trend(current, baseline).shard_trends
+        assert len(trends) == 1
+        assert tuple(case.node_id for case in trends[0].new_failures) == (
+            "tests.test_integration.test_redis::b",
+        )
+        assert tuple(case.node_id for case in trends[0].fixed) == (
+            "tests.test_integration.test_redis::a",
+        )
+
+    def test_skips_shards_missing_on_either_side(self, tmp_path: Path) -> None:
+        """边界：任一侧缺报告的分片不出现在趋势里（缺报告由状态表表达）。"""
+        reports = all_green_reports_of(tmp_path / "current")
+        write_report(tmp_path / "previous", "redis", [passing_case("redis")])
+        trend = build_aggregate_trend(
+            build_aggregate(collect_shard_reports(reports)),
+            build_aggregate(collect_shard_reports(tmp_path / "previous")),
+        )
+        assert tuple(shard.name for shard in trend.shard_trends) == ("redis",)
+
+    def test_empty_without_a_baseline(self) -> None:
+        """边界：无基线时逐分片趋势为空（首次运行该小节不出现）。"""
+        report = aggregate_of({"redis": [("a", "")]})
+        assert build_aggregate_trend(report).shard_trends == ()
+
+    def test_empty_when_baseline_has_no_reports(self) -> None:
+        """边界：基线目录一片报告都没解析出来时同样为空（缓存未命中）。"""
+        report = aggregate_of({"redis": [("a", "")]})
+        empty = build_aggregate(collect_shard_reports(Path("no-such-reports")))
+        assert build_aggregate_trend(report, empty).shard_trends == ()
+
+
 class TestComparisonRendering:
-    """对比小节的渲染：指标表、逐分片状态表、新增失败 / 已修复清单与基线不齐警告。"""
+    """对比小节的渲染：指标表、逐分片状态表、逐分片趋势、新增失败 / 已修复清单与基线不齐警告。"""
 
     def test_section_is_absent_without_a_baseline(self, all_green_reports: Path) -> None:
         """边界：无基线时不出现对比小节（首次运行的输出与 D44 保持一致）。"""
@@ -821,6 +910,60 @@ class TestComparisonRendering:
         markdown = render_markdown(report, baseline=report)
         assert "无（与基线相比没有新增失败用例）" in markdown
         assert "无（基线里没有失败用例）" in markdown
+
+    def test_shard_trend_section_lists_new_failures_and_fixed(self) -> None:
+        """正向：逐分片趋势小节逐片列出新增失败与已修复（带 node id）。"""
+        current = aggregate_of({"redis": [("a", ""), ("b", "failure")], "mysql": [("c", "")]})
+        baseline = aggregate_of({"redis": [("a", "failure"), ("b", "")], "mysql": [("c", "")]})
+        markdown = render_markdown(current, baseline=baseline)
+        assert "### 逐分片趋势（与上一轮的自己相比）" in markdown
+        assert "- `redis` · 通过率 +0.00% · 新增失败 1 · 已修复 1" in markdown
+        assert "  - 新增：`tests.test_integration.test_redis::b`" in markdown
+        assert "  - 修复：`tests.test_integration.test_redis::a`" in markdown
+        assert "- `mysql` · 通过率 +0.00% · 新增失败 0 · 已修复 0" in markdown
+
+    def test_shard_trend_section_is_absent_without_a_baseline(
+        self, all_green_reports: Path
+    ) -> None:
+        """边界：无基线时该小节整体不出现（首次运行的输出保持 D45 形态）。"""
+        markdown = render_markdown(build_aggregate(collect_shard_reports(all_green_reports)))
+        assert "逐分片趋势" not in markdown
+
+    def test_shard_trend_section_is_absent_when_no_shard_is_comparable(
+        self, tmp_path: Path
+    ) -> None:
+        """边界：基线有报告但与本轮无一片能对上时小节也不出现，对比小节本身仍在。"""
+        write_report(tmp_path / "current", "redis", [passing_case("redis")])
+        write_report(tmp_path / "previous", "mysql", [passing_case("mysql")])
+        markdown = render_markdown(
+            build_aggregate(collect_shard_reports(tmp_path / "current")),
+            baseline=build_aggregate(collect_shard_reports(tmp_path / "previous")),
+        )
+        assert "### 与上一轮对比" in markdown
+        assert "逐分片趋势" not in markdown
+
+    def test_shard_trend_section_skips_shards_without_baseline(self, tmp_path: Path) -> None:
+        """边界：基线只覆盖部分分片时，小节只列两侧齐备的分片，不伪造其它片。"""
+        reports = all_green_reports_of(tmp_path / "current")
+        write_report(tmp_path / "previous", "redis", [passing_case("redis")])
+        markdown = render_markdown(
+            build_aggregate(collect_shard_reports(reports)),
+            baseline=build_aggregate(collect_shard_reports(tmp_path / "previous")),
+        )
+        assert "### 逐分片趋势（与上一轮的自己相比）" in markdown
+        section = markdown.split("### 逐分片趋势（与上一轮的自己相比）")[1].split("###")[0]
+        assert "- `redis` ·" in section
+        assert "- `mysql` ·" not in section
+
+    def test_shard_trend_section_sits_between_delta_table_and_cross_shard_lists(self) -> None:
+        """正向：小节位置在逐分片状态表之后、跨分片清单之前（阅读顺序稳定）。"""
+        current = aggregate_of({"redis": [("a", ""), ("b", "failure")]})
+        baseline = aggregate_of({"redis": [("a", ""), ("b", "failure")]})
+        markdown = render_markdown(current, baseline=baseline)
+        delta_at = markdown.index("| `redis` | 1/2 |")
+        trend_at = markdown.index("### 逐分片趋势")
+        cross_at = markdown.index("### 本轮新增失败")
+        assert delta_at < trend_at < cross_at
 
     def test_existing_sections_and_newline_contract_are_preserved(self) -> None:
         """边界：加了对比小节后，原有小节与「单个换行结尾」的契约不变。"""
