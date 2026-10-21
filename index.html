@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>med-langchain-memory 集成测试看板</title>
+<style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f6f8fa; color: #1f2328;
+       font-family: -apple-system, "Segoe UI", "Noto Sans SC", Arial, sans-serif; }
+main { max-width: 960px; margin: 0 auto; }
+header { margin-bottom: 8px; }
+h1 { font-size: 20px; margin: 0 0 8px; }
+h2 { font-size: 15px; margin: 24px 0 8px; }
+.badge { display: inline-block; padding: 2px 10px; border-radius: 999px;
+         font-size: 13px; font-weight: 600; }
+.badge.ok { background: #dafbe1; color: #1a7f37; }
+.badge.warn { background: #fff8c5; color: #9a6700; }
+.badge.fail { background: #ffebe9; color: #cf222e; }
+.detail { color: #1f2328; font-size: 13px; margin-left: 8px; }
+.meta { color: #59636e; font-size: 12px; margin: 4px 0 0; }
+.meta a { color: #0969da; }
+table { border-collapse: collapse; width: 100%; background: #ffffff;
+        font-size: 13px; }
+th, td { border: 1px solid #d1d9e0; padding: 6px 8px; text-align: left; }
+th { background: #f6f8fa; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+ul { background: #ffffff; border: 1px solid #d1d9e0; border-radius: 6px;
+     padding: 12px 12px 12px 28px; margin: 0; font-size: 13px; }
+code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+.empty { color: #59636e; font-size: 13px; margin: 0; }
+footer { margin-top: 24px; color: #59636e; font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+<header>
+<h1>med-langchain-memory 集成测试看板</h1>
+<p><span class="badge ok">全部通过</span><span class="detail">127/127 通过</span></p>
+<p class="meta">生成时间 2026-10-21T21:00:03Z · 5/5 个分片有报告 · <a href="https://github.com/xxinjie21/med-langchain-memory/actions/runs/39674698497">查看本次运行</a></p>
+</header>
+<section>
+<h2>分片明细</h2>
+<table>
+<thead><tr><th>分片</th><th class="num">用例</th><th class="num">通过</th><th class="num">失败/错误</th><th class="num">跳过</th><th class="num">通过率</th><th class="num">耗时</th><th>较上轮</th></tr></thead>
+<tbody>
+<tr><td><code>redis</code></td><td class="num">31</td><td class="num">31</td><td class="num">0</td><td class="num">0</td><td class="num">100.00%</td><td class="num">0.052s</td><td>持平</td></tr>
+<tr><td><code>mysql</code></td><td class="num">31</td><td class="num">30</td><td class="num">0</td><td class="num">1</td><td class="num">100.00%</td><td class="num">0.873s</td><td>持平</td></tr>
+<tr><td><code>elasticsearch</code></td><td class="num">31</td><td class="num">30</td><td class="num">0</td><td class="num">1</td><td class="num">100.00%</td><td class="num">3.772s</td><td>持平</td></tr>
+<tr><td><code>redis-cluster</code></td><td class="num">35</td><td class="num">35</td><td class="num">0</td><td class="num">0</td><td class="num">100.00%</td><td class="num">1.091s</td><td>持平</td></tr>
+<tr><td><code>redis-cluster-failover</code></td><td class="num">1</td><td class="num">1</td><td class="num">0</td><td class="num">0</td><td class="num">100.00%</td><td class="num">12.607s</td><td>持平</td></tr>
+</tbody>
+</table>
+</section>
+<section>
+<h2>与上一轮对比</h2>
+<table>
+<thead><tr><th>指标</th><th class="num">本次</th><th class="num">上轮</th><th class="num">变化</th></tr></thead>
+<tbody>
+<tr><td>用例总数</td><td class="num">129</td><td class="num">129</td><td class="num">+0</td></tr>
+<tr><td>通过</td><td class="num">127</td><td class="num">127</td><td class="num">+0</td></tr>
+<tr><td>失败/错误</td><td class="num">0</td><td class="num">0</td><td class="num">+0</td></tr>
+<tr><td>跳过</td><td class="num">2</td><td class="num">2</td><td class="num">+0</td></tr>
+<tr><td>通过率</td><td class="num">100.00%</td><td class="num">100.00%</td><td class="num">+0.00%</td></tr>
+<tr><td>总耗时</td><td class="num">18.395s</td><td class="num">18.685s</td><td class="num">-0.290s</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>分片</th><th class="num">本次 通过/可执行</th><th class="num">上轮 通过/可执行</th><th class="num">失败变化</th><th class="num">通过率变化</th><th>状态</th></tr></thead>
+<tbody>
+<tr><td><code>redis</code></td><td class="num">31/31</td><td class="num">31/31</td><td class="num">+0</td><td class="num">+0.00%</td><td>持平</td></tr>
+<tr><td><code>mysql</code></td><td class="num">30/30</td><td class="num">30/30</td><td class="num">+0</td><td class="num">+0.00%</td><td>持平</td></tr>
+<tr><td><code>elasticsearch</code></td><td class="num">30/30</td><td class="num">30/30</td><td class="num">+0</td><td class="num">+0.00%</td><td>持平</td></tr>
+<tr><td><code>redis-cluster</code></td><td class="num">35/35</td><td class="num">35/35</td><td class="num">+0</td><td class="num">+0.00%</td><td>持平</td></tr>
+<tr><td><code>redis-cluster-failover</code></td><td class="num">1/1</td><td class="num">1/1</td><td class="num">+0</td><td class="num">+0.00%</td><td>持平</td></tr>
+</tbody>
+</table>
+</section>
+<h2>失败用例</h2>
+<p class="empty">无（已解析的报告里没有失败用例）</p>
+<h2>耗时最长的用例</h2>
+<ul>
+<li><code>redis-cluster-failover</code> · <code>tests.test_integration.test_redis_cluster_failover.TestClusterFailoverDrill::test_primary_failure_promotes_replica_and_keeps_read_write</code> — 12.607s</li>
+<li><code>redis-cluster</code> · <code>tests.test_integration.test_redis_cluster_live.TestRedisClusterLiveBehavior::test_new_session_reads_empty</code> — 1.022s</li>
+<li><code>elasticsearch</code> · <code>tests.test_integration.test_es_live.TestEsLiveBehavior::test_add_and_read_med_messages</code> — 0.472s</li>
+<li><code>mysql</code> · <code>tests.test_integration.test_mysql_live.TestMySQLLiveBehavior::test_new_session_reads_empty</code> — 0.386s</li>
+<li><code>elasticsearch</code> · <code>tests.test_integration.test_es_live.TestEsLiveBehavior::test_clear_removes_all_messages</code> — 0.265s</li>
+</ul>
+<footer>
+由 <code>med_langchain_memory.testing.dashboard</code> 渲染 · 数据口径与 <code>med_langchain_memory.testing.aggregate</code> 一致 · 由 <code>dashboard</code> 作业发布到 GitHub Pages（gh-pages 分支）
+</footer>
+</main>
+</body>
+</html>
