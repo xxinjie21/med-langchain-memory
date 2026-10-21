@@ -25,6 +25,9 @@ name: Integration
 # 原先由各分片作业用 trend CLI 各自维护、各滚一份缓存，现在统一上收本作业，
 # 整轮与分片粒度共享同一份基线）。上一轮的报告由本作业末尾的快照写进
 # `baseline/`，靠滚动缓存传给下一次运行，不需要任何外部存储。
+# 看板作业（D48）：`dashboard` 作业把同一份总账渲染成自包含 HTML 页面
+# （`testing/dashboard.py`，纯标准库）发布到 GitHub Pages，给夜间报告一个
+# 固定 URL 的日常入口；它只读 artifact、不拉容器、不持门禁状态。
 on:
   workflow_dispatch:
   schedule:
@@ -172,6 +175,23 @@ jobs:
           restore-keys: |
             integration-baseline-
 
+      # 缓存未命中时 baseline/ 不存在，先建目录保证后面的 artifact 上传有路径可传。
+      - name: Ensure baseline directory exists
+        run: mkdir -p baseline
+
+      # 「账本」artifact：把本轮分片报告与**恢复出来的上一轮基线**打成一个包，
+      # 供看板作业渲染「与上一轮对比」。必须在聚合之前上传——聚合步骤的
+      # --snapshot-dir 会把 baseline/ 覆盖成本轮快照，之后再上传就只剩「本轮 vs 本轮」。
+      - name: Upload ledger artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-ledger
+          path: |
+            reports
+            baseline
+          retention-days: 90
+
       # 缺报告或存在失败用例时本步退出码非 0（整轮结论），但汇总文件已先写好；
       # 同时把本轮报告快照进 baseline/，随缓存滚动给下一轮当基线。
       - name: Aggregate shard reports
@@ -186,3 +206,53 @@ jobs:
       - name: Publish aggregate summary
         if: always()
         run: cat "reports/integration-aggregate.md" >> "$GITHUB_STEP_SUMMARY"
+
+  # 看板作业（D48）：把汇总作业的同一份总账渲染成自包含 HTML 页面，发布到
+  # GitHub Pages（gh-pages 分支）。看板只是「附加视图」——不持有任何门禁状态，
+  # 矩阵或汇总红了也要发布，否则最需要看板的时候反而没有看板。
+  dashboard:
+    name: Publish nightly dashboard
+    needs: aggregate
+    if: always()
+    runs-on: ubuntu-latest
+    # 最小权限：只有本作业需要写 gh-pages 分支，其余作业保持默认只读。
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # 只装运行期依赖：渲染看板是纯标准库逻辑，不需要 dev extras，也不拉任何容器。
+      - name: Install dependencies
+        run: pip install -e .
+
+      # 账本 artifact 里既有本轮分片报告（reports/），也有聚合时恢复出来的
+      # 上一轮基线（baseline/）——看板的对比小节与 Job Summary 同源同口径。
+      - name: Download ledger artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-ledger
+          path: ledger
+
+      - name: Render dashboard page
+        run: |
+          python -m med_langchain_memory.testing.dashboard \
+            --reports-dir ledger/reports \
+            --baseline-dir ledger/baseline \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --generated-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --output "site/index.html"
+
+      # 发布到 GitHub Pages：gh-pages 分支的 index.html 即「最近一轮夜间看板」。
+      # keep_files 保留历史文件，本作业每轮只覆盖 index.html。
+      - name: Publish dashboard to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          keep_files: true

@@ -77,6 +77,10 @@ from .trend import (
 #: artifact 下载后的目录名前缀（与工作流 ``upload-artifact`` 的 ``name:`` 一致）。
 ARTIFACT_PREFIX = "integration-report-"
 
+#: 汇总作业上传的「账本」artifact 名：一个包含本轮分片报告与上一轮基线报告的包，
+#: 供 ``dashboard`` 作业渲染看板页（D48）。名字由本模块给出，工作流与测试共用。
+LEDGER_ARTIFACT_NAME = "integration-ledger"
+
 #: 聚合摘要文件名（汇总作业写进 Job Summary 的那份）。
 AGGREGATE_SUMMARY_NAME = "integration-aggregate.md"
 

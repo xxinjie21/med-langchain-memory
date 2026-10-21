@@ -34,6 +34,14 @@ These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
 * the ``aggregate`` job must also roll a **ledger baseline** forward (``actions/cache``
   keyed by run id, restored before aggregation) and pass ``--baseline-dir`` /
   ``--snapshot-dir`` so the combined summary can be diffed against the previous run;
+* since D48 the ``aggregate`` job additionally uploads a **ledger artifact**
+  (this run's shard reports plus the restored previous baseline) **before**
+  aggregating — the snapshot step overwrites ``baseline/`` with the current run,
+  so uploading afterwards would leave the dashboard comparing a run against itself;
+* the ``dashboard`` job must depend on ``aggregate``, run ``if: always()``, install
+  runtime dependencies only, start no containers, render the page with the real
+  dashboard CLI options and publish it to GitHub Pages through a version-pinned
+  action, with ``contents: write`` scoped to that job alone;
 * the ``integration`` marker must be registered in ``pyproject.toml``
   (``--strict-markers`` is enabled, so an unregistered marker fails the run);
 * every ``uses:`` reference must stay pinned to a major version tag.
@@ -70,10 +78,18 @@ from med_langchain_memory.testing.aggregate import (
     AGGREGATE_SUMMARY_NAME,
     ARTIFACT_PREFIX,
     BASELINE_LEDGER_DIR,
+    LEDGER_ARTIFACT_NAME,
     collect_shard_reports,
 )
 from med_langchain_memory.testing.aggregate import (
     build_parser as build_aggregate_parser,
+)
+from med_langchain_memory.testing.dashboard import (
+    DASHBOARD_INDEX_NAME,
+    DEFAULT_SITE_DIR,
+)
+from med_langchain_memory.testing.dashboard import (
+    build_parser as build_dashboard_parser,
 )
 from med_langchain_memory.testing.preflight import build_parser as build_preflight_parser
 from med_langchain_memory.testing.shards import build_parser as build_shards_parser
@@ -103,6 +119,23 @@ SHARDS_MODULE = "med_langchain_memory.testing.shards"
 
 #: 分片结果聚合的模块入口（与 ``testing/aggregate.py`` 的 CLI 对齐）。
 AGGREGATE_MODULE = "med_langchain_memory.testing.aggregate"
+
+#: 夜间看板渲染的模块入口（与 ``testing/dashboard.py`` 的 CLI 对齐）。
+DASHBOARD_MODULE = "med_langchain_memory.testing.dashboard"
+
+#: GitHub Pages 发布动作（D48 看板作业使用，必须锁大版本）。
+PAGES_ACTION = "peaceiris/actions-gh-pages"
+
+#: 看板作业下载账本 artifact 的目标目录。
+LEDGER_DOWNLOAD_DIR = "ledger"
+
+#: 看板 CLI 的调用整段（工作流里同样用 ``\`` 续行）。
+DASHBOARD_INVOCATION_PATTERN = re.compile(
+    rf"python -m {re.escape(DASHBOARD_MODULE)}(?P<args>(?:[^\n]*\\\n)*[^\n]*)"
+)
+
+#: shell 命令替换（如 ``$(date -u ...)``）：含空格，交给 shlex 前先替换成占位符。
+COMMAND_SUBSTITUTION_PATTERN = re.compile(r"\$\([^)]*\)")
 
 #: 工作流里的矩阵表达式（断言前统一替换成字面分片名）。
 SHARD_EXPRESSION = "${{ matrix.shard }}"
@@ -159,6 +192,15 @@ def aggregate_arguments() -> list[str]:
     match = AGGREGATE_INVOCATION_PATTERN.search(read_workflow())
     assert match is not None, f"{AGGREGATE_MODULE} is never invoked by the workflow"
     return shlex.split(match.group("args").replace("\\\n", " "))
+
+
+def dashboard_arguments() -> list[str]:
+    """Return the CLI tokens passed to the dashboard module inside the workflow."""
+    match = DASHBOARD_INVOCATION_PATTERN.search(read_workflow())
+    assert match is not None, f"{DASHBOARD_MODULE} is never invoked by the workflow"
+    raw = match.group("args").replace("\\\n", " ")
+    # ``$(date ...)`` 这类命令替换含空格，先换成占位符再交给 shlex 与真实解析器。
+    return shlex.split(COMMAND_SUBSTITUTION_PATTERN.sub("PLACEHOLDER", raw))
 
 
 def step_body(name: str) -> str:
@@ -596,6 +638,110 @@ class TestAggregateBaseline:
         assert "--baseline-dir" in readme
         assert "--snapshot-dir" in readme
         assert "与上一轮对比" in readme
+
+
+class TestDashboardJob:
+    """看板作业（D48）：同一份总账渲染成自包含 HTML，发布到 GitHub Pages。"""
+
+    def test_dashboard_job_waits_for_aggregate_and_always_runs(self) -> None:
+        """正向：看板作业依赖汇总作业，且无论汇总成败都要发布（最需要看板时反而要有看板）。"""
+        body = job_body("dashboard")
+        assert re.search(r"needs:\s*aggregate\b", body)
+        assert re.search(r"if:\s*always\(\)", body)
+
+    def test_dashboard_runs_after_aggregate(self) -> None:
+        """边界：作业顺序必须是矩阵在前、汇总居中、看板收尾。"""
+        text = read_workflow()
+        assert text.index("\n  aggregate:\n") < text.index("\n  dashboard:\n")
+
+    def test_dashboard_downloads_the_ledger_artifact_by_name(self) -> None:
+        """正向：看板按汇总作业上传的账本 artifact 名精确下载（名字由聚合模块给出）。"""
+        body = job_body("dashboard")
+        assert "actions/download-artifact@v4" in body
+        assert f"name: {LEDGER_ARTIFACT_NAME}" in body
+        assert f"path: {LEDGER_DOWNLOAD_DIR}" in body
+
+    def test_ledger_artifact_upload_runs_even_when_tests_fail(self) -> None:
+        """边界：矩阵或汇总失败时账本 artifact 仍要上传（看板要能展示失败那一轮）。"""
+        body = step_body("Upload ledger artifact")
+        assert re.search(r"if:\s*always\(\)", body)
+        assert f"name: {LEDGER_ARTIFACT_NAME}" in body
+        assert "actions/upload-artifact@v4" in body
+        assert re.search(r"path:\s*\|", body)
+        assert "reports" in body
+        assert "baseline" in body
+
+    def test_ledger_artifact_is_uploaded_before_aggregation(self) -> None:
+        """边界：账本必须在聚合之前上传——``--snapshot-dir`` 会把 baseline/ 覆盖成本轮快照，
+        之后再上传就只剩「本轮 vs 本轮」，对比小节永远显示持平。"""
+        body = aggregate_job_body()
+        upload = body.index(f"name: {LEDGER_ARTIFACT_NAME}")
+        assert upload < body.index("- name: Aggregate shard reports")
+        restore = body.index("- name: Restore previous ledger baseline")
+        assert restore < upload
+
+    def test_baseline_directory_is_prepared_before_upload(self) -> None:
+        """边界：缓存未命中时 baseline/ 不存在，先建目录再上传（首轮运行也要有账本）。"""
+        body = aggregate_job_body()
+        assert body.index("- name: Ensure baseline directory exists") < body.index(
+            f"name: {LEDGER_ARTIFACT_NAME}"
+        )
+
+    def test_dashboard_cli_is_invoked_with_real_options(self) -> None:
+        """边界：工作流传给看板 CLI 的参数必须能被真实解析器解析，且指向账本目录。"""
+        parsed = build_dashboard_parser().parse_args(dashboard_arguments())
+        assert parsed.reports_dir == Path(LEDGER_DOWNLOAD_DIR) / "reports"
+        assert parsed.baseline_dir == Path(LEDGER_DOWNLOAD_DIR) / BASELINE_LEDGER_DIR
+        assert parsed.output == Path(DEFAULT_SITE_DIR) / DASHBOARD_INDEX_NAME
+        assert parsed.shard == []
+        assert "github.run_id" in parsed.run_url
+
+    def test_dashboard_cli_options_exist_in_the_real_parser(self) -> None:
+        """边界：工作流传给看板 CLI 的每个长选项都必须真实存在。"""
+        known = {
+            option
+            for action in build_dashboard_parser()._actions
+            for option in action.option_strings
+        }
+        flags = [token for token in dashboard_arguments() if token.startswith("--")]
+        assert flags, "workflow must pass options to the dashboard module"
+        unknown = [flag for flag in flags if flag not in known]
+        assert unknown == [], f"workflow references unknown dashboard options: {unknown}"
+
+    def test_dashboard_publishes_to_github_pages(self) -> None:
+        """正向：页面通过锁版本的 Pages 动作发布，publish_dir 与 CLI 默认输出一致。"""
+        body = job_body("dashboard")
+        assert f"uses: {PAGES_ACTION}@v4" in body
+        assert f"publish_dir: ./{DEFAULT_SITE_DIR}" in body
+        assert "keep_files: true" in body
+
+    def test_publish_permissions_are_scoped_to_the_dashboard_job(self) -> None:
+        """边界：``contents: write`` 只给看板作业（其余作业保持只读，最小权限）。"""
+        assert "contents: write" in job_body("dashboard")
+        for other in ("plan", "integration", "aggregate"):
+            assert "contents: write" not in job_body(other)
+
+    def test_dashboard_job_installs_runtime_dependencies_only(self) -> None:
+        """边界：渲染看板是纯标准库逻辑，只装运行期依赖，不拉 dev extras。"""
+        body = job_body("dashboard")
+        assert "pip install -e ." in body
+        assert ".[dev]" not in body
+
+    def test_dashboard_job_starts_no_containers(self) -> None:
+        """边界：看板作业只读 artifact，不得再拉起任何中间件容器。"""
+        assert "docker compose" not in job_body("dashboard")
+
+    def test_dashboard_job_adds_no_second_baseline_cache(self) -> None:
+        """边界（D47 延续）：看板不引入第二份滚动缓存——整套夜间报告仍只有一份基线。"""
+        assert read_workflow().count("uses: actions/cache@") == 1
+        assert "actions/cache" not in job_body("dashboard")
+
+    def test_readme_documents_the_dashboard(self) -> None:
+        """正向：README 必须说明看板入口与账本 artifact（否则没人知道去哪看页面）。"""
+        readme = README_PATH.read_text(encoding="utf-8")
+        assert DASHBOARD_MODULE in readme
+        assert LEDGER_ARTIFACT_NAME in readme
+        assert "GitHub Pages" in readme
 
 
 class TestActionPinning:

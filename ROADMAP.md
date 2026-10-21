@@ -80,7 +80,7 @@ med-langchain-memory/
 │   │   │   ├── messages.py
 │   │   │   └── admin.py            # 归档/迁移管理
 │   │   └── schemas.py              # 请求/响应 DTO
-│   ├── testing/                    # 集成测试支撑（纯标准库：探针/开关、集群拓扑、JUnit 趋势、分片计划、分片聚合与总账基线对比）
+│   ├── testing/                    # 集成测试支撑（纯标准库：探针/开关、集群拓扑、JUnit 趋势、分片计划、分片聚合与总账基线对比、夜间看板渲染）
 │   └── release.py                  # 发布守卫（tag/版本一致性 + 产物校验，纯标准库）
 ├── tests/                          # 与 src 镜像的全量单测
 │   ├── conftest.py
@@ -173,9 +173,10 @@ med-langchain-memory/
 | D45 | 汇总总账与上一轮基线对比 | `testing/aggregate.py` 增 `ShardDelta`（逐分片差异 + 状态 `absent/added/removed/regressed/improved/unchanged`）、`AggregateTrend`/`build_aggregate_trend`（整轮合计变化 + 跨分片新增失败 / 已修复，基线不齐时仍可用且显式提示）、`snapshot_reports`（按规范布局快照本轮报告）、`render_markdown(..., baseline=...)` 的「与上一轮对比」小节；CLI 增 `--baseline-dir` / `--snapshot-dir`（快照在返回退出码之前完成）；`integration.yml` 汇总作业增滚动基线缓存（`path: baseline`，key 带 `run_id` + 前缀恢复）并把两个选项指向它；`tests/test_integration/test_aggregate.py` 增对比 / 快照 / CLI 用例 + `tests/test_ci/test_integration_workflow.py::TestAggregateBaseline` | `feat: daily iteration D45 - diff the aggregate ledger against the previous run` |
 | D46 | 故障转移演练独立分片 + 矩阵 plan 作业与超时预算 | `testing/shards.py`：`Shard.timeout_minutes`（默认 `DEFAULT_TIMEOUT_MINUTES`）、`--format matrix`（`render_matrix` 渲染单行矩阵 JSON：分片名 + 逐片超时，键名 `MATRIX_SHARD_KEY`/`MATRIX_TIMEOUT_KEY`）、集群分片拆出 `redis-cluster-failover`（演练自带 6 节点集群，不污染只读套件）；`integration.yml` 新增 `plan` 作业（`--format matrix` → `$GITHUB_OUTPUT`）+ `integration` 作业 `needs: plan`、`matrix: ${{ fromJSON(...) }}`、`timeout-minutes: ${{ matrix.timeout_minutes }}`；`tests/test_integration/test_shards.py` 与 `tests/test_ci/test_integration_workflow.py`（分片契约 + plan 作业契约 + CLI 交叉校验） | `feat: daily iteration D46 - dedicated failover shard with timeout budgets` |
 | D47 | 两套基线合一：分片粒度趋势上收汇总作业 | `testing/aggregate.py` 增 `ShardTrend` 与 `AggregateTrend.shard_trends`（汇总作业用同一份 `baseline/` 快照对两侧齐备的分片逐片构建 `trend.build_trend`，口径复用不重写）+ 渲染「逐分片趋势」小节（逐片通过率变化 / 新增失败 / 已修复）；`integration.yml` 分片作业删除 per-shard `actions/cache` 与 trend CLI 调用（整套夜间报告只留汇总作业一份滚动基线）；`tests/test_integration/test_aggregate.py`（ShardTrend 转发 / shard_trends 构建 / 渲染小节）+ `tests/test_ci/test_integration_workflow.py`（重写 `TestTrendReporting`：无 trend CLI、单一缓存、README 契约） | `feat: daily iteration D47 - unified baseline for shard-level trend report` |
+| D48 | 夜间看板：总账渲染为自包含 HTML 发布到 GitHub Pages | `testing/dashboard.py`（纯标准库：结论徽标 / 分片明细 / 与上一轮对比 / 失败与最慢用例清单，全量 `html.escape`，内联 CSS 零外部资源零 JS；CLI `--reports-dir` / `--baseline-dir` / `--output` / `--run-url` / `--generated-at` / `--slowest` / `--shard`，退出码 0/1/2/3，**先写页面后返回退出码**）；`testing/aggregate.py` 增 `LEDGER_ARTIFACT_NAME`；`integration.yml`：`aggregate` 作业在**聚合之前**上传 `integration-ledger` artifact（本轮报告 + 恢复出来的上一轮基线——聚合的 `--snapshot-dir` 会覆盖 `baseline/`）+ 新增 `dashboard` 作业（`needs: aggregate` + `if: always()`，只装运行期依赖、不拉容器：下载账本 → 渲染 `site/index.html` → `peaceiris/actions-gh-pages@v4` 发布，`contents: write` 仅授予该作业）；`tests/test_integration/test_dashboard.py`（离线）+ `tests/test_ci/test_integration_workflow.py::TestDashboardJob`（账本上传顺序 / CLI 交叉校验 / Pages 发布 / 权限范围） | `feat: daily iteration D48 - publish nightly dashboard to github pages` |
 
-> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`）；
-> ② 夜间趋势接入外部看板（如把摘要推送到 PR 评论 / 状态徽章）。
+> 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`；
+> 并到仓库 Settings → Pages 开启 `gh-pages` 源以启用 D48 看板）；② 夜间趋势接入外部看板（如把摘要推送到 PR 评论 / 状态徽章）。
 
 ---
 

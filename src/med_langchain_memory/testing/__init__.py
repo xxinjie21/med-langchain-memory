@@ -7,9 +7,11 @@
 :mod:`med_langchain_memory.testing.cluster`（集群拓扑解析与故障转移演练）、
 :mod:`med_langchain_memory.testing.trend`（JUnit 报告汇总与趋势对比）、
 :mod:`med_langchain_memory.testing.preflight`（CI 前置守卫：必需服务不可用即失败）、
-:mod:`med_langchain_memory.testing.shards`（集成套件按服务分片：并行作业的单一真值来源）与
+:mod:`med_langchain_memory.testing.shards`（集成套件按服务分片：并行作业的单一真值来源）、
 :mod:`med_langchain_memory.testing.aggregate`（分片结果聚合：分片报告合成一份总账、
-与上一轮基线对比（含逐分片用例级趋势 :class:`ShardTrend`）、给出单一退出码）。
+与上一轮基线对比（含逐分片用例级趋势 :class:`ShardTrend`）、给出单一退出码）与
+:mod:`med_langchain_memory.testing.dashboard`（把同一份总账渲染成自包含 HTML
+看板页，由工作流发布到 GitHub Pages）。
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from .aggregate import (
     EXIT_INCOMPLETE,
     EXIT_OK,
     EXIT_USAGE,
+    LEDGER_ARTIFACT_NAME,
     AggregateReport,
     AggregateTrend,
     ShardDelta,
@@ -60,6 +63,13 @@ from .cluster import (
 # 注意：preflight 的 CLI 入口（build_parser / main）**不**在此导出——
 # 包根上的这两个名字已经属于 trend 的 CLI，导出会造成静默覆盖。
 # 守卫的入口按模块路径调用：``python -m med_langchain_memory.testing.preflight``。
+from .dashboard import (
+    DASHBOARD_INDEX_NAME,
+    DASHBOARD_TITLE,
+    DEFAULT_OUTPUT_PATH,
+    DEFAULT_SITE_DIR,
+    render_dashboard,
+)
 from .preflight import (
     ENV_REQUIRED,
     PreflightReport,
@@ -138,11 +148,15 @@ __all__ = [
     "CLUSTER_INITIALIZER",
     "COMPOSE_HINT",
     "COMPOSE_PROJECT_NAME",
+    "DASHBOARD_INDEX_NAME",
+    "DASHBOARD_TITLE",
     "DEFAULT_DOCKER_TIMEOUT_SECONDS",
+    "DEFAULT_OUTPUT_PATH",
     "DEFAULT_POLL_INTERVAL_SECONDS",
     "DEFAULT_PROBE_TIMEOUT_SECONDS",
     "DEFAULT_REPORTS_DIR",
     "DEFAULT_SERVICES",
+    "DEFAULT_SITE_DIR",
     "DEFAULT_SLOWEST_LIMIT",
     "DEFAULT_TIMEOUT_MINUTES",
     "DEFAULT_WAIT_INTERVAL_SECONDS",
@@ -157,6 +171,7 @@ __all__ = [
     "FORMATS",
     "INTEGRATION_TEST_DIR",
     "JUNIT_REPORT_NAME",
+    "LEDGER_ARTIFACT_NAME",
     "MATRIX_SHARD_KEY",
     "MATRIX_TIMEOUT_KEY",
     "RECOVERY_WAIT_SECONDS",
@@ -201,6 +216,7 @@ __all__ = [
     "preflight",
     "probe_tcp",
     "render_compose",
+    "render_dashboard",
     "render_env",
     "render_init",
     "render_markdown",

@@ -545,6 +545,33 @@ key 带 `run_id`、`restore-keys` 前缀命中上一次），由汇总作业自�
 
 ---
 
+### ADR-20 · 夜间报告发布为 GitHub Pages 看板，而不是只活在 Job Summary
+
+**决策**：新增 `testing/dashboard.py`（纯标准库）与工作流 `dashboard` 作业，
+把汇总作业已经得出的同一份总账（`AggregateReport` / `AggregateTrend`）渲染成
+一份**自包含** HTML 页面（内联 CSS、零外部资源、零 JS、浅色主题、全量
+`html.escape`），由 `peaceiris/actions-gh-pages@v4` 发布到 `gh-pages` 分支，
+给夜间集成报告一个固定 URL 的日常入口。
+
+| 关注点 | 实现 | 为什么这样切 |
+|---|---|---|
+| 数据同源 | 看板直接消费 `aggregate` 模块的聚合对象，不重新解析 XML、不重新定义通过率 / 状态判定 | 「页面与 Job Summary 不一致」比「没有页面」更糟；复用同一渲染口径只需维护一套 |
+| 数据搬运 | `aggregate` 作业在**聚合之前**上传 `integration-ledger` artifact（本轮报告 + 刚恢复的上一轮基线），看板作业只下载这一个包 | 聚合的 `--snapshot-dir` 会把 `baseline/` 覆盖成本轮快照，之后再上传就只剩「本轮 vs 本轮」；顺序由 `TestDashboardJob` 静态钉死 |
+| 门禁关系 | 看板作业 `if: always()`、不持门禁状态、退出码仅本地排查用 | 看板是附加视图：矩阵或汇总红了**更要**发布，否则最需要看板的时候反而没有看板 |
+| 权限 | `contents: write` 只授予 `dashboard` 作业（其余作业默认只读） | 最小权限：能写分支的作业越少越好 |
+| 注入面 | 页面无表单、无 JS，所有动态文本（用例名 / 分片名 / 运行链接）一律转义 | 节点 ID 理论上是不可信输入；零 JS 也意味着没有 XSS 执行环境 |
+
+**理由**：D41–D47 把报告越做越细，但结论只存在于 GitHub Actions 的 Job Summary
+与 artifact 里——「今晚绿没绿」需要人主动登进 GitHub、找到当次运行、点开作业。
+看板把这个动作变成一个书签；同时它只读 artifact、不拉容器、不碰门禁，
+新增它的边际风险接近零。
+
+**代价**：多一个第三方动作依赖（`peaceiris/actions-gh-pages`，已锁大版本，
+静态测试校验）；仓库需要开启 Pages（Settings → Pages → `gh-pages`），
+未开启时发布步骤会失败——但这只让看板作业红，不影响任何测试结论。
+
+---
+
 ## 5. 并发与可用性
 
 | 机制 | 实现 | 降级路径 |
@@ -602,6 +629,7 @@ key 带 `run_id`、`restore-keys` 前缀命中上一次），由汇总作业自�
 | 趋势上报 | `testing/trend.py` 解析 JUnit 报告渲染 Markdown 摘要，是本地单报告场景的入口（CLI 保留）；夜间工作流的趋势自 D47 起统一由汇总作业渲染（见下一行），离线单测在 `tests/test_integration/test_trend.py` |
 | 分片结果聚合 | `testing/aggregate.py` 把五个分片的报告聚合成一份总账（分片明细 + 合计 + 缺失报告 + 失败用例 + 最慢用例）写入 Job Summary，并以退出码 `0/1/2/3` 区分「齐备无失败 / 缺报告 / 有失败 / 参数非法」；离线单测在 `tests/test_integration/test_aggregate.py` |
 | 总账基线对比 | 同一模块的 `AggregateTrend` / `build_aggregate_trend` 拿 `--baseline-dir` 的上一轮报告算出整轮合计变化、逐分片状态、跨分片的新增失败 / 已修复，以及**逐分片用例级趋势**（`ShardTrend` / `shard_trends`，口径复用 `trend.build_trend`，即 ADR-19 的「两套基线合一」）；`--snapshot-dir` 把本轮报告写进 `baseline/`，由汇总作业唯一的 `actions/cache` 滚动给下一轮；无基线时对比小节整体消失（纯增量）；离线单测同上，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestAggregateBaseline` 与 `TestTrendReporting` |
+| 夜间看板 | `testing/dashboard.py` 把同一份总账渲染成自包含 HTML（内联 CSS、零外部资源、零 JS、全量转义）并由 `dashboard` 作业发布到 GitHub Pages（ADR-20）；数据来自 `aggregate` 作业在聚合前上传的 `integration-ledger` artifact（顺序由静态测试钉死）；看板不持门禁状态，`contents: write` 只授予该作业；离线单测在 `tests/test_integration/test_dashboard.py`，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestDashboardJob` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |

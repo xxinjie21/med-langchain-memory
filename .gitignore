@@ -50,3 +50,7 @@ reports/
 
 # Rolling ledger baseline written by the aggregate job (and by --snapshot-dir locally)
 baseline/
+
+# Rendered dashboard page produced locally by testing/dashboard.py (the nightly
+# workflow publishes the CI-rendered one to the gh-pages branch instead)
+site/
