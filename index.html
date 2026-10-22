@@ -38,18 +38,18 @@ footer { margin-top: 24px; color: #59636e; font-size: 12px; }
 <header>
 <h1>med-langchain-memory 集成测试看板</h1>
 <p><span class="badge ok">全部通过</span><span class="detail">127/127 通过</span></p>
-<p class="meta">生成时间 2026-10-21T21:00:03Z · 5/5 个分片有报告 · <a href="https://github.com/xxinjie21/med-langchain-memory/actions/runs/39674698497">查看本次运行</a></p>
+<p class="meta">生成时间 2026-10-22T21:00:34Z · 5/5 个分片有报告 · <a href="https://github.com/xxinjie21/med-langchain-memory/actions/runs/39852891913">查看本次运行</a></p>
 </header>
 <section>
 <h2>分片明细</h2>
 <table>
 <thead><tr><th>分片</th><th class="num">用例</th><th class="num">通过</th><th class="num">失败/错误</th><th class="num">跳过</th><th class="num">通过率</th><th class="num">耗时</th><th>较上轮</th></tr></thead>
 <tbody>
-<tr><td><code>redis</code></td><td class="num">31</td><td class="num">31</td><td class="num">0</td><td class="num">0</td><td class="num">100.00%</td><td class="num">0.052s</td><td>持平</td></tr>
-<tr><td><code>mysql</code></td><td class="num">31</td><td class="num">30</td><td class="num">0</td><td class="num">1</td><td class="num">100.00%</td><td class="num">0.873s</td><td>持平</td></tr>
-<tr><td><code>elasticsearch</code></td><td class="num">31</td><td class="num">30</td><td class="num">0</td><td class="num">1</td><td class="num">100.00%</td><td class="num">3.772s</td><td>持平</td></tr>
-<tr><td><code>redis-cluster</code></td><td class="num">35</td><td class="num">35</td><td class="num">0</td><td class="num">0</td><td class="num">100.00%</td><td class="num">1.091s</td><td>持平</td></tr>
-<tr><td><code>redis-cluster-failover</code></td><td class="num">1</td><td class="num">1</td><td class="num">0</td><td class="num">0</td><td class="num">100.00%</td><td class="num">12.607s</td><td>持平</td></tr>
+<tr><td><code>redis</code></td><td class="num">31</td><td class="num">31</td><td class="num">0</td><td class="num">0</td><td class="num">100.00%</td><td class="num">0.034s</td><td>持平</td></tr>
+<tr><td><code>mysql</code></td><td class="num">31</td><td class="num">30</td><td class="num">0</td><td class="num">1</td><td class="num">100.00%</td><td class="num">0.816s</td><td>持平</td></tr>
+<tr><td><code>elasticsearch</code></td><td class="num">31</td><td class="num">30</td><td class="num">0</td><td class="num">1</td><td class="num">100.00%</td><td class="num">6.381s</td><td>持平</td></tr>
+<tr><td><code>redis-cluster</code></td><td class="num">35</td><td class="num">35</td><td class="num">0</td><td class="num">0</td><td class="num">100.00%</td><td class="num">0.115s</td><td>持平</td></tr>
+<tr><td><code>redis-cluster-failover</code></td><td class="num">1</td><td class="num">1</td><td class="num">0</td><td class="num">0</td><td class="num">100.00%</td><td class="num">11.880s</td><td>持平</td></tr>
 </tbody>
 </table>
 </section>
@@ -63,7 +63,7 @@ footer { margin-top: 24px; color: #59636e; font-size: 12px; }
 <tr><td>失败/错误</td><td class="num">0</td><td class="num">0</td><td class="num">+0</td></tr>
 <tr><td>跳过</td><td class="num">2</td><td class="num">2</td><td class="num">+0</td></tr>
 <tr><td>通过率</td><td class="num">100.00%</td><td class="num">100.00%</td><td class="num">+0.00%</td></tr>
-<tr><td>总耗时</td><td class="num">18.395s</td><td class="num">18.685s</td><td class="num">-0.290s</td></tr>
+<tr><td>总耗时</td><td class="num">19.226s</td><td class="num">18.395s</td><td class="num">+0.831s</td></tr>
 </tbody>
 </table>
 <table>
@@ -81,11 +81,11 @@ footer { margin-top: 24px; color: #59636e; font-size: 12px; }
 <p class="empty">无（已解析的报告里没有失败用例）</p>
 <h2>耗时最长的用例</h2>
 <ul>
-<li><code>redis-cluster-failover</code> · <code>tests.test_integration.test_redis_cluster_failover.TestClusterFailoverDrill::test_primary_failure_promotes_replica_and_keeps_read_write</code> — 12.607s</li>
-<li><code>redis-cluster</code> · <code>tests.test_integration.test_redis_cluster_live.TestRedisClusterLiveBehavior::test_new_session_reads_empty</code> — 1.022s</li>
-<li><code>elasticsearch</code> · <code>tests.test_integration.test_es_live.TestEsLiveBehavior::test_add_and_read_med_messages</code> — 0.472s</li>
-<li><code>mysql</code> · <code>tests.test_integration.test_mysql_live.TestMySQLLiveBehavior::test_new_session_reads_empty</code> — 0.386s</li>
-<li><code>elasticsearch</code> · <code>tests.test_integration.test_es_live.TestEsLiveBehavior::test_clear_removes_all_messages</code> — 0.265s</li>
+<li><code>redis-cluster-failover</code> · <code>tests.test_integration.test_redis_cluster_failover.TestClusterFailoverDrill::test_primary_failure_promotes_replica_and_keeps_read_write</code> — 11.880s</li>
+<li><code>elasticsearch</code> · <code>tests.test_integration.test_es_live.TestEsLiveBehavior::test_read_limit_larger_than_size_returns_all</code> — 0.759s</li>
+<li><code>elasticsearch</code> · <code>tests.test_integration.test_es_live.TestEsLiveBehavior::test_add_and_read_med_messages</code> — 0.750s</li>
+<li><code>elasticsearch</code> · <code>tests.test_integration.test_es_live.TestEsLiveBehavior::test_message_count_and_updated_at_are_tracked</code> — 0.574s</li>
+<li><code>elasticsearch</code> · <code>tests.test_integration.test_es_live.TestEsLiveArchive::test_clear_removes_archived_documents</code> — 0.430s</li>
 </ul>
 <footer>
 由 <code>med_langchain_memory.testing.dashboard</code> 渲染 · 数据口径与 <code>med_langchain_memory.testing.aggregate</code> 一致 · 由 <code>dashboard</code> 作业发布到 GitHub Pages（gh-pages 分支）
