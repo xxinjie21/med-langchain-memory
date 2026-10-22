@@ -1,6 +1,7 @@
 # med-langchain-memory
 
 [![CI](https://github.com/xxinjie21/med-langchain-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/xxinjie21/med-langchain-memory/actions/workflows/ci.yml)
+[![Integration nightly](https://img.shields.io/github/actions/workflow/status/xxinjie21/med-langchain-memory/integration.yml?branch=main&label=integration%20nightly)](https://github.com/xxinjie21/med-langchain-memory/actions/workflows/integration.yml)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](./LICENSE)
 [![Ruff](https://img.shields.io/badge/lint-ruff-261230.svg)](https://github.com/astral-sh/ruff)
@@ -261,7 +262,7 @@ docker compose -f docker-compose.integration.yml down -v
 | 地址覆盖 | `MED_MEMORY_IT_REDIS_URL` / `MED_MEMORY_IT_MYSQL_URL` / `MED_MEMORY_IT_ELASTICSEARCH_URL` / `MED_MEMORY_IT_REDIS_CLUSTER_URL` |
 | 用例范围 | 复用 `tests/test_stores/behavior.py` 跨后端行为基准套件，再补服务端特有断言（键类型、原生 TTL、分表落表、按月索引、hash tag 同 slot、集群 pipeline 语义、集群故障转移） |
 | MySQL 前置 | DBAPI 驱动 `pymysql` 随 `[mysql]` / `[dev]` extras 一起装，缺失时 MySQL 用例跳过 |
-| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；按服务**分片并行**，跑之前先过分片前置守卫，五个分片只产出各自的 JUnit 报告，趋势与总账统一由汇总作业基于**同一份滚动基线**渲染，并由看板作业发布为 GitHub Pages 页面（见下） |
+| CI | 可选工作流 `.github/workflows/integration.yml`（手动触发 + **每日夜间定时**），不阻塞 `ci.yml` 必过门禁；按服务**分片并行**，跑之前先过分片前置守卫，五个分片只产出各自的 JUnit 报告，趋势与总账统一由汇总作业基于**同一份滚动基线**渲染，由看板作业发布为 GitHub Pages 页面，并由汇总作业把整轮结论回写为 commit status 徽章（context: `integration/nightly`，见下） |
 
 探针与开关逻辑在 `med_langchain_memory/testing/services.py`，只用标准库，
 因此「能不能跑」的判断本身不依赖任何中间件客户端。
@@ -448,6 +449,33 @@ python -m med_langchain_memory.testing.dashboard \
 `tests/test_integration/test_dashboard.py`，工作流契约在
 `tests/test_ci/test_integration_workflow.py::TestDashboardJob`。
 
+### 状态徽章（commit status）
+
+看板是「打开才看」的视图，徽章是「一眼就看」的视图：`aggregate` 作业末尾把
+**同一份总账的结论**回写成 commit status（context: `integration/nightly`），
+于是 README 顶部徽章与提交页 / 检查列表都有「最近一轮夜间集成绿没绿」的一眼结论。
+发布逻辑在 `med_langchain_memory/testing/notifier.py`，**纯标准库**
+（`urllib.request` + `json`）：
+
+| 项 | 说明 |
+|---|---|
+| 状态映射 | 全绿 → `success`；齐备但有失败用例 → `failure`；报告缺失或其它退出码 → `error`（基础设施故障禁止伪装成绿灯）。口径与聚合 CLI 的退出码逐字同源（`aggregate.verdict_exit_code`，两处不可能漂移） |
+| 内容 | `description` 是一句话结论（`12/12 passed across 5 shards` / `1 failing of 12 across 5 shards` / `1/5 shards missing reports`，超 140 字符截断）；`target_url` 指向当次运行 |
+| 结论现算 | 发布步骤直接读同一份 `reports/` 现算结论，不依赖上一步的退出码传递——上一步挂了（缺报告）照样能发布 `error`，而不是静默跳过 |
+| 为什么不是 PR 评论 | 集成工作流只挂 `workflow_dispatch` + 夜间 cron：重型 docker 套件不该随每个 PR 运行，因此没有 PR 可评论；commit status 是同一信息在「提交维度」的正确载体 |
+| 容错 | 步骤带 `continue-on-error`：token 失效或网络故障只是「徽章没更新」，不把作业染红；`statuses: write` 权限只授予 `aggregate` 作业（最小权限） |
+| 安全 | token 只经 `GITHUB_TOKEN` 环境变量传入，不出现在命令行；POST 经可注入 opener 完成，离线单测不碰网络 |
+
+本地生成本仓库的徽章片段（或换成自己的 `owner/name` 粘进 README）：
+
+```bash
+python -m med_langchain_memory.testing.notifier --repo xxinjie21/med-langchain-memory --print-badge
+```
+
+离线单测在 `tests/test_integration/test_notifier.py`（假 opener 替身 + 子进程级
+`python -m` 入口校验），工作流契约在
+`tests/test_ci/test_integration_workflow.py::TestStatusNotification`。
+
 
 ### Redis Cluster（三主三从）
 
@@ -532,7 +560,7 @@ python -m med_langchain_memory.release --dist dist --expected-version v0.1.0   #
 
 ## 每日迭代节奏
 
-项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行、D44 分片结果聚合汇总作业、D45 汇总总账与上一轮基线对比、D46 故障转移演练独立分片与超时预算、D47 两套基线合一：分片粒度趋势上收汇总作业、D48 夜间看板：总账渲染为自包含 HTML 发布到 GitHub Pages）。
+项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行、D44 分片结果聚合汇总作业、D45 汇总总账与上一轮基线对比、D46 故障转移演练独立分片与超时预算、D47 两套基线合一：分片粒度趋势上收汇总作业、D48 夜间看板：总账渲染为自包含 HTML 发布到 GitHub Pages、D49 状态徽章：夜间集成结论回写 commit status）。
 
 ---
 

@@ -28,6 +28,10 @@ name: Integration
 # 看板作业（D48）：`dashboard` 作业把同一份总账渲染成自包含 HTML 页面
 # （`testing/dashboard.py`，纯标准库）发布到 GitHub Pages，给夜间报告一个
 # 固定 URL 的日常入口；它只读 artifact、不拉容器、不持门禁状态。
+# 状态徽章（D49）：`aggregate` 作业末尾把整轮结论回写成 commit status
+# （context: `integration/nightly`，`testing/notifier.py`，纯标准库），
+# README 徽章与提交检查列表因此都有「最近一轮夜间集成绿没绿」的一眼结论；
+# 发布失败只是徽章没更新，步骤带 `continue-on-error`，不染红任何测试结论。
 on:
   workflow_dispatch:
   schedule:
@@ -144,6 +148,10 @@ jobs:
     # 矩阵作业用 fail-fast: false 跑完五个分片，这里无论成败都要出总账。
     if: always()
     runs-on: ubuntu-latest
+    # 最小权限：只有本作业需要回写 commit status（D49 状态徽章）；
+    # 看板作业另持 Pages 分支写权限，其余作业保持默认只读。
+    permissions:
+      statuses: write
     steps:
       - uses: actions/checkout@v4
 
@@ -206,6 +214,23 @@ jobs:
       - name: Publish aggregate summary
         if: always()
         run: cat "reports/integration-aggregate.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # 状态徽章（D49）：把整轮结论回写成 commit status（context: integration/nightly），
+      # 于是 README 徽章与提交检查列表都有「最近一轮绿没绿」的一眼结论。结论由
+      # notifier 复用聚合口径现算（读同一份 reports/，verdict_exit_code 与聚合 CLI
+      # 同源），不依赖上一步的退出码传递；token 走 env 不进命令行。推送失败只是
+      # 「徽章没更新」，不该把作业染红，故 continue-on-error。
+      - name: Post nightly integration status
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -m med_langchain_memory.testing.notifier \
+            --repo "${{ github.repository }}" \
+            --sha "${{ github.sha }}" \
+            --reports-dir reports \
+            --target-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   # 看板作业（D48）：把汇总作业的同一份总账渲染成自包含 HTML 页面，发布到
   # GitHub Pages（gh-pages 分支）。看板只是「附加视图」——不持有任何门禁状态，

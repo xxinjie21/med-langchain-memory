@@ -42,6 +42,11 @@ These tests parse ``.github/workflows/integration.yml`` with stdlib-only tooling
   runtime dependencies only, start no containers, render the page with the real
   dashboard CLI options and publish it to GitHub Pages through a version-pinned
   action, with ``contents: write`` scoped to that job alone;
+* since D49 the ``aggregate`` job additionally posts the **same verdict** as a
+  GitHub commit status (``integration/nightly``) through the real notifier CLI,
+  with ``statuses: write`` scoped to that job alone, the token passed through the
+  environment rather than the command line, and ``continue-on-error`` so a failed
+  badge update never turns a green run red;
 * the ``integration`` marker must be registered in ``pyproject.toml``
   (``--strict-markers`` is enabled, so an unregistered marker fails the run);
 * every ``uses:`` reference must stay pinned to a major version tag.
@@ -91,6 +96,10 @@ from med_langchain_memory.testing.dashboard import (
 from med_langchain_memory.testing.dashboard import (
     build_parser as build_dashboard_parser,
 )
+from med_langchain_memory.testing.notifier import STATUS_CONTEXT
+from med_langchain_memory.testing.notifier import (
+    build_parser as build_notifier_parser,
+)
 from med_langchain_memory.testing.preflight import build_parser as build_preflight_parser
 from med_langchain_memory.testing.shards import build_parser as build_shards_parser
 from med_langchain_memory.testing.trend import JUNIT_REPORT_NAME
@@ -102,8 +111,9 @@ PYPROJECT_PATH = PROJECT_ROOT / "pyproject.toml"
 README_PATH = PROJECT_ROOT / "README.md"
 COMPOSE_PATH = PROJECT_ROOT / "docker-compose.integration.yml"
 
-#: 形如 ``uses: actions/checkout@v4`` 的动作引用。
-USES_PATTERN = re.compile(r"uses:\s*(\S+)")
+#: 形如 ``uses: actions/checkout@v4`` 的动作引用（锚定行首，避免误匹配
+#: ``permissions:`` 里的 ``statuses: write`` 这类同尾字串）。
+USES_PATTERN = re.compile(r"^\s*uses:\s*(\S+)", re.MULTILINE)
 
 #: 允许的动作引用形态：``owner/repo@v<major>``。
 PINNED_ACTION_PATTERN = re.compile(r"[\w.-]+/[\w.-]+@v\d+$")
@@ -123,6 +133,12 @@ AGGREGATE_MODULE = "med_langchain_memory.testing.aggregate"
 #: 夜间看板渲染的模块入口（与 ``testing/dashboard.py`` 的 CLI 对齐）。
 DASHBOARD_MODULE = "med_langchain_memory.testing.dashboard"
 
+#: 状态发布（D49）的模块入口（与 ``testing/notifier.py`` 的 CLI 对齐）。
+NOTIFIER_MODULE = "med_langchain_memory.testing.notifier"
+
+#: 发布 commit status 的步骤名（工作流里这一步的名字）。
+NOTIFIER_STEP_NAME = "Post nightly integration status"
+
 #: GitHub Pages 发布动作（D48 看板作业使用，必须锁大版本）。
 PAGES_ACTION = "peaceiris/actions-gh-pages"
 
@@ -132,6 +148,11 @@ LEDGER_DOWNLOAD_DIR = "ledger"
 #: 看板 CLI 的调用整段（工作流里同样用 ``\`` 续行）。
 DASHBOARD_INVOCATION_PATTERN = re.compile(
     rf"python -m {re.escape(DASHBOARD_MODULE)}(?P<args>(?:[^\n]*\\\n)*[^\n]*)"
+)
+
+#: notifier CLI 的调用整段（工作流里同样用 ``\`` 续行）。
+NOTIFIER_INVOCATION_PATTERN = re.compile(
+    rf"python -m {re.escape(NOTIFIER_MODULE)}(?P<args>(?:[^\n]*\\\n)*[^\n]*)"
 )
 
 #: shell 命令替换（如 ``$(date -u ...)``）：含空格，交给 shlex 前先替换成占位符。
@@ -200,6 +221,14 @@ def dashboard_arguments() -> list[str]:
     assert match is not None, f"{DASHBOARD_MODULE} is never invoked by the workflow"
     raw = match.group("args").replace("\\\n", " ")
     # ``$(date ...)`` 这类命令替换含空格，先换成占位符再交给 shlex 与真实解析器。
+    return shlex.split(COMMAND_SUBSTITUTION_PATTERN.sub("PLACEHOLDER", raw))
+
+
+def notifier_arguments() -> list[str]:
+    """Return the CLI tokens passed to the notifier module inside the workflow."""
+    match = NOTIFIER_INVOCATION_PATTERN.search(read_workflow())
+    assert match is not None, f"{NOTIFIER_MODULE} is never invoked by the workflow"
+    raw = match.group("args").replace("\\\n", " ")
     return shlex.split(COMMAND_SUBSTITUTION_PATTERN.sub("PLACEHOLDER", raw))
 
 
@@ -742,6 +771,75 @@ class TestDashboardJob:
         assert DASHBOARD_MODULE in readme
         assert LEDGER_ARTIFACT_NAME in readme
         assert "GitHub Pages" in readme
+
+
+class TestStatusNotification:
+    """状态徽章（D49）：汇总作业把整轮结论回写成 commit status。"""
+
+    def test_status_is_posted_after_the_summary_is_published(self) -> None:
+        """正向：先贴总账再广播状态（顺序即「先总结、后通知」）。"""
+        body = aggregate_job_body()
+        publish = body.index("- name: Publish aggregate summary")
+        assert publish < body.index(f"- name: {NOTIFIER_STEP_NAME}")
+
+    def test_status_step_always_runs_and_never_fails_the_job(self) -> None:
+        """边界：步骤 ``if: always()`` 且 ``continue-on-error``——徽章没更新不染红测试结论。"""
+        body = step_body(NOTIFIER_STEP_NAME)
+        assert re.search(r"if:\s*always\(\)", body)
+        assert "continue-on-error: true" in body
+
+    def test_notifier_cli_is_invoked_with_real_options(self) -> None:
+        """边界：工作流传给 notifier CLI 的参数必须能被真实解析器解析。"""
+        parsed = build_notifier_parser().parse_args(notifier_arguments())
+        assert parsed.repo == "${{ github.repository }}"
+        assert parsed.sha == "${{ github.sha }}"
+        assert parsed.reports_dir == Path(AGGREGATE_REPORTS_DIR)
+        assert "github.run_id" in parsed.target_url
+
+    def test_notifier_cli_options_exist_in_the_real_parser(self) -> None:
+        """边界：工作流传给 notifier CLI 的每个长选项都必须真实存在。"""
+        known = {
+            option
+            for action in build_notifier_parser()._actions
+            for option in action.option_strings
+        }
+        flags = [token for token in notifier_arguments() if token.startswith("--")]
+        assert flags, "workflow must pass options to the notifier module"
+        unknown = [flag for flag in flags if flag not in known]
+        assert unknown == [], f"workflow references unknown notifier options: {unknown}"
+
+    def test_token_goes_through_the_environment_not_the_command_line(self) -> None:
+        """边界：token 只经 ``GITHUB_TOKEN`` 传入，命令行不出现 secret（避免进日志）。"""
+        body = step_body(NOTIFIER_STEP_NAME)
+        assert "GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}" in body
+        arguments = notifier_arguments()
+        assert "--token" not in arguments
+        assert "secrets.GITHUB_TOKEN" not in " ".join(arguments)
+
+    def test_status_context_comes_from_the_module_not_the_workflow(self) -> None:
+        """边界：context 名只在模块里定义，工作流不重复声明字面量（口径不漂移）。"""
+        assert STATUS_CONTEXT == "integration/nightly"
+        assert f'context: "{STATUS_CONTEXT}"' not in read_workflow()
+
+    def test_status_write_permission_is_scoped_to_the_aggregate_job(self) -> None:
+        """边界：``statuses: write`` 只给汇总作业（最小权限；其余作业保持默认只读）。"""
+        assert re.search(r"permissions:\s*\n\s*statuses:\s*write", aggregate_job_body())
+        for other in ("plan", "integration", "dashboard"):
+            assert "statuses: write" not in job_body(other)
+
+    def test_status_step_starts_no_containers_and_adds_no_cache(self) -> None:
+        """边界：发布步骤不拉容器、不引入第二份缓存（整套夜间报告仍只有一份基线）。"""
+        body = step_body(NOTIFIER_STEP_NAME)
+        assert "docker compose" not in body
+        assert "actions/cache" not in body
+        assert read_workflow().count("uses: actions/cache@") == 1
+
+    def test_readme_documents_the_status_badge(self) -> None:
+        """正向：README 必须带夜间集成徽章并说明状态发布入口（否则没人知道去哪看）。"""
+        readme = README_PATH.read_text(encoding="utf-8")
+        assert NOTIFIER_MODULE in readme
+        assert "img.shields.io/github/actions/workflow/status" in readme
+        assert STATUS_CONTEXT in readme
 
 
 class TestActionPinning:

@@ -11,7 +11,9 @@
 :mod:`med_langchain_memory.testing.aggregate`（分片结果聚合：分片报告合成一份总账、
 与上一轮基线对比（含逐分片用例级趋势 :class:`ShardTrend`）、给出单一退出码）与
 :mod:`med_langchain_memory.testing.dashboard`（把同一份总账渲染成自包含 HTML
-看板页，由工作流发布到 GitHub Pages）。
+看板页，由工作流发布到 GitHub Pages）与
+:mod:`med_langchain_memory.testing.notifier`（把同一份总账的结论回写成 GitHub
+commit status，并给出 README 徽章片段）。
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from .aggregate import (
     collect_shard_reports,
     shard_report_path,
     snapshot_reports,
+    verdict_exit_code,
 )
 
 # 注意：aggregate 的 CLI 入口（build_parser / main）同样**不**在此导出——
@@ -69,6 +72,27 @@ from .dashboard import (
     DEFAULT_OUTPUT_PATH,
     DEFAULT_SITE_DIR,
     render_dashboard,
+)
+
+# 注意：notifier 的 CLI 入口（build_parser / main）同样**不**在此导出——
+# 包根这两个名字属于 trend 的 CLI。状态发布入口按模块路径调用：
+# ``python -m med_langchain_memory.testing.notifier``。
+from .notifier import (
+    EXIT_BAD_REPO,
+    EXIT_POST_FAILED,
+    EXIT_POSTED,
+    INTEGRATION_WORKFLOW_FILE,
+    MAX_DESCRIPTION_LENGTH,
+    STATUS_CONTEXT,
+    StatusState,
+    badge_markdown,
+    badge_url,
+    build_status_payload,
+    post_commit_status,
+    status_description,
+    status_state_for_exit_code,
+    statuses_url,
+    workflow_url,
 )
 from .preflight import (
     ENV_REQUIRED,
@@ -163,20 +187,26 @@ __all__ = [
     "DEFAULT_WAIT_SECONDS",
     "ENV_PREFIX",
     "ENV_REQUIRED",
+    "EXIT_BAD_REPO",
     "EXIT_FAILURES",
     "EXIT_INCOMPLETE",
     "EXIT_OK",
+    "EXIT_POST_FAILED",
+    "EXIT_POSTED",
     "EXIT_USAGE",
     "FAILOVER_WAIT_SECONDS",
     "FORMATS",
     "INTEGRATION_TEST_DIR",
+    "INTEGRATION_WORKFLOW_FILE",
     "JUNIT_REPORT_NAME",
     "LEDGER_ARTIFACT_NAME",
     "MATRIX_SHARD_KEY",
     "MATRIX_TIMEOUT_KEY",
+    "MAX_DESCRIPTION_LENGTH",
     "RECOVERY_WAIT_SECONDS",
     "REDIS_CLUSTER_NODE_PORTS",
     "SHARDS",
+    "STATUS_CONTEXT",
     "TREND_SUMMARY_NAME",
     "AggregateReport",
     "AggregateTrend",
@@ -192,11 +222,15 @@ __all__ = [
     "ShardDeltaState",
     "ShardStatus",
     "ShardTrend",
+    "StatusState",
     "SuiteReport",
     "TrendReport",
+    "badge_markdown",
+    "badge_url",
     "build_aggregate",
     "build_aggregate_trend",
     "build_parser",
+    "build_status_payload",
     "build_trend",
     "check_service",
     "cluster_container_name",
@@ -213,6 +247,7 @@ __all__ = [
     "parse_required",
     "parse_slots",
     "plan_failover",
+    "post_commit_status",
     "preflight",
     "probe_tcp",
     "render_compose",
@@ -232,6 +267,11 @@ __all__ = [
     "shard_names",
     "shard_report_path",
     "snapshot_reports",
+    "status_description",
+    "status_state_for_exit_code",
+    "statuses_url",
     "wait_for_service",
+    "verdict_exit_code",
     "wait_until",
+    "workflow_url",
 ]

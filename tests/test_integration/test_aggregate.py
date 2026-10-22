@@ -35,6 +35,7 @@ from med_langchain_memory.testing.aggregate import (
     render_markdown,
     shard_report_path,
     snapshot_reports,
+    verdict_exit_code,
 )
 from med_langchain_memory.testing.shards import shard_names
 from med_langchain_memory.testing.trend import JUNIT_REPORT_NAME, build_trend, parse_junit_xml
@@ -392,6 +393,37 @@ class TestRenderMarkdown:
         """边界：渲染结果以单个换行结尾（可直接 ``cat >> $GITHUB_STEP_SUMMARY``）。"""
         markdown = render_markdown(build_aggregate(collect_shard_reports(all_green_reports)))
         assert markdown.endswith("\n") and not markdown.endswith("\n\n")
+
+
+class TestVerdictExitCode:
+    """整轮结论的退出码口径（D49 起与 notifier 的状态发布共用的单一真值来源）。"""
+
+    def test_positive_all_green(self, all_green_reports: Path) -> None:
+        """正向：齐备且无失败用例 → ``EXIT_OK``。"""
+        report = build_aggregate(collect_shard_reports(all_green_reports))
+        assert verdict_exit_code(report) == EXIT_OK
+
+    def test_boundary_incomplete_wins_over_failures(self, tmp_path: Path) -> None:
+        """边界：缺报告（即使另有失败用例）→ ``EXIT_INCOMPLETE``（基础设施问题优先）。"""
+        write_report(
+            tmp_path,
+            "redis",
+            [make_case("tests.test_integration.test_redis", "test_bad", kind="failure")],
+        )
+        report = build_aggregate(collect_shard_reports(tmp_path))
+        assert verdict_exit_code(report) == EXIT_INCOMPLETE
+
+    def test_boundary_failures_when_complete(self, tmp_path: Path) -> None:
+        """边界：报告齐备但有失败用例 → ``EXIT_FAILURES``。"""
+        for name in shard_names():
+            cases = [passing_case(name)]
+            if name == "mysql":
+                cases.append(
+                    make_case("tests.test_integration.test_mysql", "test_bad", kind="failure")
+                )
+            write_report(tmp_path, name, cases)
+        report = build_aggregate(collect_shard_reports(tmp_path))
+        assert verdict_exit_code(report) == EXIT_FAILURES
 
 
 class TestCli:

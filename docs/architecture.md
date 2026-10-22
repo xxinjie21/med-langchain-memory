@@ -570,6 +570,30 @@ key 带 `run_id`、`restore-keys` 前缀命中上一次），由汇总作业自�
 静态测试校验）；仓库需要开启 Pages（Settings → Pages → `gh-pages`），
 未开启时发布步骤会失败——但这只让看板作业红，不影响任何测试结论。
 
+### ADR-21 · 夜间结论以 commit status 广播，而不是 PR 评论
+
+**决策**：新增 `testing/notifier.py`（纯标准库）与 `aggregate` 作业末尾的
+「Post nightly integration status」步骤，把汇总作业已经得出的**同一份总账结论**
+回写成 GitHub commit status（context: `integration/nightly`），README 顶部再加一枚
+shields.io workflow 状态徽章，让「最近一轮夜间集成绿没绿」一眼可见。
+
+| 关注点 | 实现 | 为什么这样切 |
+|---|---|---|
+| 结论口径 | 发布步骤直接读同一份 `reports/`，用 `aggregate.verdict_exit_code`（聚合 CLI 自己那条退出码）现算状态，不依赖上一步的退出码传递 | 上一步挂了（缺报告）照样能发布 `error`，而不是静默跳过；两处对「绿没绿」的判定共用单一真值，不可能漂移 |
+| 状态映射 | 全绿 → `success`；齐备但有失败用例 → `failure`；缺报告 / 其它退出码 → `error` | 「报告缺失」是 CI 基础设施问题，必须与「代码失败」区分——禁止把基础设施故障显示成绿灯 |
+| 载体选择 | commit status（提交页 / 检查列表可见 + `target_url` 指向当次运行），不做 PR 评论 | 集成工作流只挂 `workflow_dispatch` + 夜间 cron：重型 docker 套件不该随每个 PR 运行，因此没有 PR 可评论；commit status 是同一信息在「提交维度」的正确载体 |
+| 容错 | 步骤 `if: always()` + `continue-on-error`；`statuses: write` 只授予 `aggregate` 作业 | token 失效或网络故障只是「徽章没更新」，不该把作业染红；最小权限 |
+| 凭据 | token 只经 `GITHUB_TOKEN` 环境变量传入，不出现在命令行；POST 经可注入 `opener` 完成 | 命令行参数会进日志；可注入 opener 让离线单测不碰网络 |
+
+**理由**：D41–D48 的产物（总账、趋势、看板）都是「登进 GitHub 才能看」的视图。
+commit status 把结论推到提交维度：仓库首页徽章常亮，任何点开提交的人都能看到
+`integration/nightly` 的状态与运行链接，不需要知道 Actions 页面怎么翻。
+
+**代价**：多一次 GitHub API 调用（失败被 `continue-on-error` 吸收，不影响测试结论）；
+徽章依赖 shields.io 可用性（图片裂了只是看不到徽章，不影响仓库任何功能）。
+若未来为集成工作流增加 `pull_request` 触发，可在同一模块上加评论发布，
+但当前设计刻意不为「随 PR 跑重型 docker 套件」开门。
+
 ---
 
 ## 5. 并发与可用性
@@ -630,6 +654,7 @@ key 带 `run_id`、`restore-keys` 前缀命中上一次），由汇总作业自�
 | 分片结果聚合 | `testing/aggregate.py` 把五个分片的报告聚合成一份总账（分片明细 + 合计 + 缺失报告 + 失败用例 + 最慢用例）写入 Job Summary，并以退出码 `0/1/2/3` 区分「齐备无失败 / 缺报告 / 有失败 / 参数非法」；离线单测在 `tests/test_integration/test_aggregate.py` |
 | 总账基线对比 | 同一模块的 `AggregateTrend` / `build_aggregate_trend` 拿 `--baseline-dir` 的上一轮报告算出整轮合计变化、逐分片状态、跨分片的新增失败 / 已修复，以及**逐分片用例级趋势**（`ShardTrend` / `shard_trends`，口径复用 `trend.build_trend`，即 ADR-19 的「两套基线合一」）；`--snapshot-dir` 把本轮报告写进 `baseline/`，由汇总作业唯一的 `actions/cache` 滚动给下一轮；无基线时对比小节整体消失（纯增量）；离线单测同上，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestAggregateBaseline` 与 `TestTrendReporting` |
 | 夜间看板 | `testing/dashboard.py` 把同一份总账渲染成自包含 HTML（内联 CSS、零外部资源、零 JS、全量转义）并由 `dashboard` 作业发布到 GitHub Pages（ADR-20）；数据来自 `aggregate` 作业在聚合前上传的 `integration-ledger` artifact（顺序由静态测试钉死）；看板不持门禁状态，`contents: write` 只授予该作业；离线单测在 `tests/test_integration/test_dashboard.py`，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestDashboardJob` |
+| 状态徽章 | `testing/notifier.py`（纯标准库，可注入 opener 的 HTTP 替身）把同一份总账的结论回写成 commit status（context: `integration/nightly`，状态口径与聚合 CLI 的 `verdict_exit_code` 同源）；步骤 `continue-on-error`、`statuses: write` 只授予 `aggregate` 作业；离线单测在 `tests/test_integration/test_notifier.py`，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestStatusNotification` |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |

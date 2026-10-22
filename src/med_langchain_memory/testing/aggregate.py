@@ -33,6 +33,10 @@ JUnit 报告聚合成一份汇总（分片明细表 + 合计行 + 缺失报告�
   缓存报告，也不再调用趋势 CLI；
 * 只做计数、排序与聚合，不读取、不处理任何测试输出文本内容。
 
+退出码口径 :func:`verdict_exit_code` 是**共用真值**：聚合 CLI 与状态发布 CLI
+（:mod:`med_langchain_memory.testing.notifier`，D49 的 commit status）都调它，
+两处对「绿没绿」的判定不可能漂移。
+
 退出码（汇总作业的整轮结论）：
 
 ===========  ==========================================================
@@ -320,6 +324,21 @@ def build_aggregate(statuses: Sequence[ShardStatus]) -> AggregateReport:
         :class:`AggregateReport`。
     """
     return AggregateReport(statuses=tuple(statuses))
+
+
+def verdict_exit_code(report: AggregateReport) -> int:
+    """整轮结论的退出码口径（聚合 CLI 与状态发布 CLI 共用的单一真值来源）。
+
+    Args:
+        report: 本轮聚合报告。
+
+    Returns:
+        :data:`EXIT_OK`（齐备且无失败）/ :data:`EXIT_INCOMPLETE`（有分片缺报告）/
+        :data:`EXIT_FAILURES`（齐备但有失败用例）。
+    """
+    if not report.complete:
+        return EXIT_INCOMPLETE
+    return EXIT_FAILURES if report.has_failures else EXIT_OK
 
 
 @dataclass(frozen=True)
@@ -858,9 +877,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.output.write_text(markdown, encoding="utf-8")
     if args.snapshot_dir is not None:
         snapshot_reports(args.reports_dir, args.snapshot_dir, names)
-    if not report.complete:
-        return EXIT_INCOMPLETE
-    return EXIT_FAILURES if report.has_failures else EXIT_OK
+    return verdict_exit_code(report)
 
 
 if __name__ == "__main__":  # pragma: no cover
