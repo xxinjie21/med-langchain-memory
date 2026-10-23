@@ -541,7 +541,7 @@ git push origin v0.1.0        # 触发 release.yml
 | 作业 | 动作 |
 |---|---|
 | `verify` | ① 版本守卫：tag ↔ pyproject ↔ `__version__` 三方比对；② 全量 `pytest`；③ `python -m build` 产出 sdist + wheel；④ 产物校验：sdist/wheel 齐全、wheel 内必需成员与元数据版本正确；⑤ 上传 `distributions` artifact |
-| `github-release` | 用官方 `gh release create` 建 Release，附上 sdist/wheel 并自动生成说明（`--verify-tag` 保证 tag 真实存在） |
+| `github-release` | 先按 Conventional Commits 渲染发布说明（`changelog.py`：范围为上一个 tag..HEAD，首次发布取全历史），再用官方 `gh release create` 建 Release，附上 sdist/wheel 与说明文件（`--verify-tag` 保证 tag 真实存在） |
 | `publish-pypi` | **默认关闭**；仅当仓库变量 `PUBLISH_TO_PYPI` 设为 `true` 时执行，走 PyPI Trusted Publishing（OIDC），不需要任何 token secret |
 
 权限按最小化授予：顶层 `contents: read`，只有建 Release 的作业提升为
@@ -556,11 +556,20 @@ python -m med_langchain_memory.release --dist dist --expected-version v0.1.0   #
 
 两条命令通过返回 `0`，失败返回 `1` 并逐条打印差异（CI 日志里可直接定位）。
 
+**发布说明**不再依赖 GitHub 的 `--generate-notes`：`changelog.py`（纯标准库）
+解析 `git log` 里符合 Conventional Commits 规范的提交，按 type 分组渲染
+Markdown（Breaking Changes 章节置顶，未知 type 也有兜底标题），本地即可预演：
+
+```bash
+python -m med_langchain_memory.changelog --tag v0.1.0 --rev-range v0.0.9..HEAD
+python -m med_langchain_memory.changelog --log-file commits.txt --output notes.md  # 离线渲染
+```
+
 ---
 
 ## 每日迭代节奏
 
-项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行、D44 分片结果聚合汇总作业、D45 汇总总账与上一轮基线对比、D46 故障转移演练独立分片与超时预算、D47 两套基线合一：分片粒度趋势上收汇总作业、D48 夜间看板：总账渲染为自包含 HTML 发布到 GitHub Pages、D49 状态徽章：夜间集成结论回写 commit status）。
+项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行、D44 分片结果聚合汇总作业、D45 汇总总账与上一轮基线对比、D46 故障转移演练独立分片与超时预算、D47 两套基线合一：分片粒度趋势上收汇总作业、D48 夜间看板：总账渲染为自包含 HTML 发布到 GitHub Pages、D49 状态徽章：夜间集成结论回写 commit status、D50 发布说明：Conventional Commits 渲染替代 GitHub 自动生成）。
 
 ---
 

@@ -60,6 +60,31 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 发布说明由 Conventional Commits 渲染：需要完整历史（含历史 tag）与包本身。
+      - name: Check out repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 生成器是纯标准库模块，不拉运行时依赖。
+      - name: Install package without dependencies
+        run: pip install -e . --no-deps
+
+      - name: Generate release notes from conventional commits
+        run: |
+          prev_tag="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [ -n "$prev_tag" ]; then
+            rev_range="${prev_tag}..HEAD"
+          else
+            rev_range="HEAD"
+          fi
+          python -m med_langchain_memory.changelog --tag "${GITHUB_REF_NAME}" --rev-range "$rev_range" --output release-notes.md
+
       - name: Download distributions
         uses: actions/download-artifact@v4
         with:
@@ -69,7 +94,7 @@ jobs:
       - name: Create release with artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --notes-file release-notes.md
 
   publish-pypi:
     name: Publish to PyPI

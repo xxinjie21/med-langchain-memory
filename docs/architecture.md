@@ -596,6 +596,35 @@ commit status 把结论推到提交维度：仓库首页徽章常亮，任何点
 
 ---
 
+### ADR-22 · 发布说明由 Conventional Commits 渲染，而不是 GitHub 自动生成
+
+**决策**：新增 `med_langchain_memory/changelog.py`（纯标准库，与 `release.py`
+同级的发布工程工具）：解析 `git log` 输出里符合 Conventional Commits 规范的提交
+（`type(scope)!: description`，`!` 或 `BREAKING CHANGE:` 脚注标记破坏性变更），
+按 type 分组渲染 Markdown（Breaking Changes 置顶），由 `release.yml` 的
+`github-release` 作业在 `gh release create` 之前生成 `release-notes.md`，
+以 `--notes-file` 替代原来的 `--generate-notes`。
+
+| 关注点 | 实现 | 为什么这样切 |
+|---|---|---|
+| 范围推断 | `git describe --tags --abbrev=0 <tag>^` 找上一个 tag 构造 `prev..HEAD`；找不到（首次发布）回退全历史 | 「本次发布到底改了什么」的正确口径就是两个 tag 之间；首次发布没有上一个 tag，全历史比报错更合理 |
+| 历史依赖 | 发布作业 `checkout` 带 `fetch-depth: 0` | 浅克隆拿不到历史 tag，范围推断直接失效；多拉几百 KB 历史对发布作业无感 |
+| 依赖面 | 生成器只用标准库；作业里 `pip install -e . --no-deps` | 发布说明不该为渲染一段 Markdown 拉一遍 elasticsearch/fastapi 运行时依赖 |
+| 单一真值 | 项目提交纪律本身就是 Conventional Commits（ROADMAP 第五节），分组章节序由 `TYPE_TITLES` 单一常量定义 | GitHub 自动说明按 PR 维度罗列，对「一天一迭代、commit 即单元」的仓库信息密度低；自己的格式自己控制 |
+| 可测性 | 输入是 git log 文本（`--log-file`），`collect_commits` 的 `subprocess.run` 可注入替身；工作流里的 CLI 选项与 `build_parser()` 交叉校验 | 单测全程离线；工作流改了选项名会立刻被 `TestReleaseNotes` 抓到 |
+
+**理由**：D38 的发布流水线把「版本守卫 + 产物校验」卡得很死，但 Release 的
+正文一直交给 GitHub 自动生成——那是唯一一个「内容质量不受本项目控制」的发布
+产物。提交信息本来就有严格规范，解析成本是一层正则，换来结构稳定、可本地
+预演（`python -m med_langchain_memory.changelog`）、可随仓库演进调整章节的
+发布说明。
+
+**代价**：解析只认 Conventional Commits，不合规提交会被静默跳过（合并提交
+同样跳过）；首次发布渲染全历史，说明会偏长（一次性成本）。若未来切换提交
+规范，需同步调整 `SUBJECT_PATTERN` 与 `TYPE_TITLES`（有单测守着）。
+
+---
+
 ## 5. 并发与可用性
 
 | 机制 | 实现 | 降级路径 |
@@ -655,6 +684,7 @@ commit status 把结论推到提交维度：仓库首页徽章常亮，任何点
 | 总账基线对比 | 同一模块的 `AggregateTrend` / `build_aggregate_trend` 拿 `--baseline-dir` 的上一轮报告算出整轮合计变化、逐分片状态、跨分片的新增失败 / 已修复，以及**逐分片用例级趋势**（`ShardTrend` / `shard_trends`，口径复用 `trend.build_trend`，即 ADR-19 的「两套基线合一」）；`--snapshot-dir` 把本轮报告写进 `baseline/`，由汇总作业唯一的 `actions/cache` 滚动给下一轮；无基线时对比小节整体消失（纯增量）；离线单测同上，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestAggregateBaseline` 与 `TestTrendReporting` |
 | 夜间看板 | `testing/dashboard.py` 把同一份总账渲染成自包含 HTML（内联 CSS、零外部资源、零 JS、全量转义）并由 `dashboard` 作业发布到 GitHub Pages（ADR-20）；数据来自 `aggregate` 作业在聚合前上传的 `integration-ledger` artifact（顺序由静态测试钉死）；看板不持门禁状态，`contents: write` 只授予该作业；离线单测在 `tests/test_integration/test_dashboard.py`，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestDashboardJob` |
 | 状态徽章 | `testing/notifier.py`（纯标准库，可注入 opener 的 HTTP 替身）把同一份总账的结论回写成 commit status（context: `integration/nightly`，状态口径与聚合 CLI 的 `verdict_exit_code` 同源）；步骤 `continue-on-error`、`statuses: write` 只授予 `aggregate` 作业；离线单测在 `tests/test_integration/test_notifier.py`，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestStatusNotification` |
+| 发布说明 | `changelog.py`（纯标准库，与 `release.py` 同级的发布工程工具）解析 git log 里的 Conventional Commits，按 type 分组渲染 Markdown（Breaking Changes 置顶），`release.yml` 以 `--notes-file` 替代 `--generate-notes`；范围为上一个 tag..HEAD（`git describe` 推断，首轮回退全历史）；离线单测在 `tests/test_changelog.py`，工作流契约在 `tests/test_ci/test_release_workflow.py::TestReleaseNotes`（ADR-22） |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |

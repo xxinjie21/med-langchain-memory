@@ -8,17 +8,19 @@ Release」，而这两件事都很难回滚。因此这里用纯标准库（正�
 * 构建前先跑版本守卫（tag ↔ pyproject ↔ ``__version__``），构建后再校验产物；
 * 权限最小化：顶层只读，只有建 Release 的作业可写 ``contents``；
 * 发布 PyPI 是**显式可选**步骤（仓库变量开关 + OIDC 可信发布，无 token secret）；
-* 工作流里用到的命令行选项必须是 ``release.py`` 真实提供的选项；
+* 工作流里用到的命令行选项必须是 ``release.py`` / ``changelog.py`` 真实提供的选项；
 * 所有 ``uses:`` 引用都锁定版本。
 """
 
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 import pytest
 
+from med_langchain_memory.changelog import build_parser as build_changelog_parser
 from med_langchain_memory.release import TAG_PREFIX, build_parser
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +38,14 @@ PINNED_ACTION_PATTERN = re.compile(r"[\w.-]+/[\w.-]+@(?:v\d+|release/v\d+)$")
 #: 工作流中必须出现的 ``release.py`` 选项。
 CLI_FLAGS = ("--tag", "--dist", "--expected-version", "--pyproject")
 
+#: changelog 生成器模块（发布说明由其渲染）。
+CHANGELOG_MODULE = "med_langchain_memory.changelog"
+
+#: 工作流中 changelog CLI 的调用行（单行，无反斜杠续行）。
+CHANGELOG_INVOCATION_PATTERN = re.compile(
+    rf"python -m {re.escape(CHANGELOG_MODULE)}(?P<args>[^\n]*)"
+)
+
 
 def read_workflow() -> str:
     """返回发布工作流的原始文本。
@@ -47,6 +57,35 @@ def read_workflow() -> str:
     text = WORKFLOW_PATH.read_text(encoding="utf-8")
     assert text.strip(), "workflow file must not be empty"
     return text
+
+
+def job_body(job: str) -> str:
+    """返回某个顶层作业的 YAML 文本（截断到下一个作业）。"""
+    match = re.search(
+        rf"^ {{2}}{re.escape(job)}:\n(?P<body>.*?)(?=\n {{2}}\S|\Z)",
+        read_workflow(),
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"job {job!r} is missing from the workflow"
+    return match.group("body")
+
+
+def step_body(name: str) -> str:
+    """返回某个步骤的 YAML 文本（截断到下一个步骤）。"""
+    match = re.search(
+        rf"- name: {re.escape(name)}\n(?P<body>.*?)(?=\n\s*- name:|\Z)",
+        read_workflow(),
+        re.DOTALL,
+    )
+    assert match is not None, f"step {name!r} is missing from the workflow"
+    return match.group("body")
+
+
+def changelog_arguments() -> list[str]:
+    """返回工作流里传给 changelog CLI 的参数 token 列表。"""
+    match = CHANGELOG_INVOCATION_PATTERN.search(read_workflow())
+    assert match is not None, f"{CHANGELOG_MODULE} is never invoked by the workflow"
+    return shlex.split(match.group("args").strip())
 
 
 class TestWorkflowFile:
@@ -152,12 +191,12 @@ class TestLeastPrivilege:
 
 class TestReleaseJobs:
     def test_github_release_creates_release_with_artifacts(self) -> None:
-        """正向：用官方 ``gh`` 建 Release，附上 sdist/wheel 并自动生成说明。"""
+        """正向：用官方 ``gh`` 建 Release，附上 sdist/wheel 与生成的发布说明。"""
         text = read_workflow()
         assert re.search(r"^ {2}github-release:", text, re.MULTILINE)
         assert "gh release create" in text
         assert "--verify-tag" in text
-        assert "--generate-notes" in text
+        assert "--notes-file release-notes.md" in text
         assert "dist/*" in text
         assert "GH_TOKEN: ${{ github.token }}" in text
 
@@ -182,6 +221,55 @@ class TestReleaseJobs:
     def test_pypi_publish_uses_protected_environment(self) -> None:
         """边界：发布作业应绑定受保护环境，便于人工审批。"""
         assert re.search(r"^ {4}environment:\s*pypi\s*$", read_workflow(), re.MULTILINE)
+
+
+class TestReleaseNotes:
+    """发布说明由 Conventional Commits 渲染（替代 GitHub 自动生成说明）。"""
+
+    def test_release_notes_are_generated_from_conventional_commits(self) -> None:
+        """正向：发布作业调用 changelog 生成器渲染发布说明。"""
+        text = read_workflow()
+        assert "Generate release notes from conventional commits" in text
+        assert f"python -m {CHANGELOG_MODULE}" in text
+
+    def test_changelog_cli_uses_real_options(self) -> None:
+        """正向：工作流里的 changelog 选项必须是生成器真实提供的选项。"""
+        args = changelog_arguments()
+        assert args, "workflow must call the changelog CLI"
+        parsed = build_changelog_parser().parse_args(args)
+        assert parsed.tag is not None
+        assert parsed.rev_range is not None
+        assert parsed.output is not None
+
+    def test_release_notes_step_runs_before_release_creation(self) -> None:
+        """正向：发布说明必须先于 ``gh release create`` 生成（否则无文件可附）。"""
+        text = read_workflow()
+        generate = text.index("Generate release notes from conventional commits")
+        create = text.index("gh release create")
+        assert generate < create
+
+    def test_release_uses_notes_file_not_generate_notes(self) -> None:
+        """边界：Release 必须挂生成的说明文件，不得回退到 GitHub 自动说明。"""
+        text = read_workflow()
+        assert "--notes-file release-notes.md" in text
+        assert "--generate-notes" not in text
+
+    def test_release_notes_job_checks_out_full_history(self) -> None:
+        """正向：渲染说明需要完整历史（含历史 tag），checkout 不得浅克隆。"""
+        release_job = job_body("github-release")
+        assert "actions/checkout@v4" in release_job
+        assert re.search(r"^\s+fetch-depth:\s*0\s*$", release_job, re.MULTILINE)
+
+    def test_release_notes_install_package_without_dependencies(self) -> None:
+        """正向：生成器零依赖，安装不带运行时依赖。"""
+        assert "pip install -e . --no-deps" in job_body("github-release")
+
+    def test_release_notes_cover_the_full_history_for_first_release(self) -> None:
+        """边界：无上一个 tag（首次发布）时回退为全历史，范围非空。"""
+        body = step_body("Generate release notes from conventional commits")
+        assert "git describe --tags --abbrev=0" in body
+        assert "${prev_tag}..HEAD" in body
+        assert 'rev_range="HEAD"' in body
 
 
 class TestActionPinning:

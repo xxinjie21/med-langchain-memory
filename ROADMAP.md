@@ -177,8 +177,10 @@ med-langchain-memory/
 
 | D49 | 状态徽章：夜间结论回写 commit status | `testing/notifier.py`（纯标准库：退出码→state 映射 `status_state_for_exit_code`（全绿 `success` / 有失败 `failure` / 缺报告及其余 `error`）、一句话结论 `status_description`（140 字符截断）、`build_status_payload`、`statuses_url`（repo 形式校验）、可注入 opener 的 `post_commit_status`（`urllib.request` POST，鉴权与 API 版本头）、shields.io 徽章 `badge_url`/`badge_markdown`/`workflow_url`、CLI `--repo`/`--sha`/`--reports-dir`/`--token`（默认 `$GITHUB_TOKEN`）/`--target-url`/`--print-badge`，退出码 `0/1/3`，**结论现算不传递退出码**）；`testing/aggregate.py` 抽出 `verdict_exit_code`（聚合 CLI 与状态发布共用的单一退出码口径，`main` 改为调用它）；`integration.yml`：`aggregate` 作业增 `permissions: statuses: write`（仅此作业）与「Post nightly integration status」步骤（`if: always()` + `continue-on-error`，token 走 env）；`tests/test_integration/test_notifier.py`（假 opener 替身 + 子进程级 `python -m` 入口校验）+ `tests/test_ci/test_integration_workflow.py::TestStatusNotification`（CLI 交叉校验 / 权限作用域 / token 不进命令行 / 顺序）+ `tests/test_integration/test_aggregate.py` 补 `verdict_exit_code` 用例 | `feat: daily iteration D49 - post nightly integration status as commit status` |
 
+| D50 | 发布说明生成 | `changelog.py`（纯标准库：Conventional Commits 解析 `parse_commit`/`parse_git_log`、分组 `group_by_type`、Markdown 渲染 `render_markdown`（Breaking Changes 置顶）、git 收集 `collect_commits`、CLI `--tag`/`--rev-range`/`--log-file`/`--output`/`--date`，退出码 `0/2`）；`release.yml` 的 `github-release` 作业以 `--notes-file release-notes.md` 替代 `--generate-notes`（checkout `fetch-depth: 0` + `git describe` 推断上一个 tag 构造范围，首轮回退全历史；`pip install -e . --no-deps`）；`tests/test_changelog.py`（离线全量 + 子进程入口）+ `tests/test_ci/test_release_workflow.py::TestReleaseNotes`（CLI 交叉校验 / 顺序 / 回退） | `feat: daily iteration D50 - generate release notes from conventional commits` |
+
 > 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`；
-> 并到仓库 Settings → Pages 开启 `gh-pages` 源以启用 D48 看板）；② D49 已完成「状态徽章」一半，PR 评论一半**暂不适用**——
+> 并到仓库 Settings → Pages 开启 `gh-pages` 源以启用 D48 看板）；② PR 评论发布**暂不适用**——
 > 集成工作流只挂 `workflow_dispatch` + 夜间 cron（重型 docker 套件不该随 PR 运行），没有 PR 可评论；若未来增加
 > `pull_request` 触发，可在 `testing/notifier.py` 同模块上加评论发布。
 
