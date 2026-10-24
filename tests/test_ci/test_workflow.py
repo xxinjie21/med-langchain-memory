@@ -126,3 +126,47 @@ class TestActionPinning:
     )
     def test_expected_core_actions_present(self, action: str) -> None:
         assert action in read_workflow()
+
+
+class TestCommitLintJob:
+    """``commit-lint`` 作业契约（D51 提交信息守门）。"""
+
+    def test_job_only_runs_on_pull_requests(self) -> None:
+        """PR 之外的推送不重 lint 已落地历史，作业挂在 ``pull_request`` 条件上。"""
+        text = read_workflow()
+        assert re.search(r"^\s{2}commit-lint:", text, re.MULTILINE)
+        assert "if: github.event_name == 'pull_request'" in text
+
+    def test_checkout_fetches_full_history_for_the_range(self) -> None:
+        """范围 ``origin/<base>..HEAD`` 需要完整历史，checkout 必须 ``fetch-depth: 0``。"""
+        text = read_workflow()
+        assert re.search(r"^\s{2}commit-lint:", text, re.MULTILINE)
+        assert "fetch-depth: 0" in text
+
+    def test_job_installs_package_without_dependencies(self) -> None:
+        """守门是纯标准库工具，装包不拉第三方依赖（``--no-deps``）。"""
+        assert "pip install -e . --no-deps" in read_workflow()
+
+    def test_job_runs_the_real_cli_entry(self) -> None:
+        """运行命令必须是真实存在的 ``python -m`` 入口与 PR 范围表达式。"""
+        text = read_workflow()
+        assert "python -m med_langchain_memory.testing.commitlint" in text
+        assert "origin/${{ github.base_ref }}..HEAD" in text
+
+    def test_cli_options_exist_for_the_documented_usage(self) -> None:
+        """交叉校验：工作流用到的模块与选项在 CLI 解析器里真实存在。"""
+        from med_langchain_memory.testing import commitlint
+
+        parser = commitlint.build_parser()
+        options = {option for action in parser._actions for option in action.option_strings}
+        assert "--message" in options
+        assert "--message-file" in options
+        assert commitlint.__name__ == "med_langchain_memory.testing.commitlint"
+
+    def test_pre_commit_hook_wired_at_commit_msg_stage(self) -> None:
+        """pre-commit 的 ``commit-msg`` 钩子与 CI 作业共用同一个入口。"""
+        config_path = REPO_ROOT / ".pre-commit-config.yaml"
+        assert config_path.is_file(), "missing .pre-commit-config.yaml"
+        config = config_path.read_text(encoding="utf-8")
+        assert "stages: [commit-msg]" in config
+        assert "python -m med_langchain_memory.testing.commitlint --message-file" in config

@@ -179,10 +179,14 @@ med-langchain-memory/
 
 | D50 | 发布说明生成 | `changelog.py`（纯标准库：Conventional Commits 解析 `parse_commit`/`parse_git_log`、分组 `group_by_type`、Markdown 渲染 `render_markdown`（Breaking Changes 置顶）、git 收集 `collect_commits`、CLI `--tag`/`--rev-range`/`--log-file`/`--output`/`--date`，退出码 `0/2`）；`release.yml` 的 `github-release` 作业以 `--notes-file release-notes.md` 替代 `--generate-notes`（checkout `fetch-depth: 0` + `git describe` 推断上一个 tag 构造范围，首轮回退全历史；`pip install -e . --no-deps`）；`tests/test_changelog.py`（离线全量 + 子进程入口）+ `tests/test_ci/test_release_workflow.py::TestReleaseNotes`（CLI 交叉校验 / 顺序 / 回退） | `feat: daily iteration D50 - generate release notes from conventional commits` |
 
+| D51 | 提交信息守门 | `testing/commitlint.py`（纯标准库：字段级规则校验主题行 `type(scope)!: description`、type/scope 白名单、描述尾随空白/句点、72 字符上限、正文空行分隔，git 注释行预剥；`lint_message`/`parse_git_log_messages`/`iter_commit_messages`/`lint_commits`/`render_report`，CLI `--message`/`--message-file`/位置范围，退出码 `0/1/2`）；`.pre-commit-config.yaml` 增本地 `commit-msg` 钩子（与 CI 共用同一入口）；`ci.yml` 增 `commit-lint` 作业（仅 `pull_request`，范围 `origin/${{ github.base_ref }}..HEAD`，`fetch-depth: 0`，`pip install -e . --no-deps`）；`tests/test_integration/test_commitlint.py`（离线 + 子进程入口）+ `tests/test_ci/test_workflow.py::TestCommitLintJob`（作业契约 + CLI 交叉校验 + pre-commit 钩子） | `feat: daily iteration D51 - conventional commits lint gate` |
+
 > 阶段 5 后续方向（**待用户决策**，不预设顺序）：① 正式推送 `v0.1.0` tag 触发首次发布（需维护者执行 `git push origin v0.1.0`；
 > 并到仓库 Settings → Pages 开启 `gh-pages` 源以启用 D48 看板）；② PR 评论发布**暂不适用**——
 > 集成工作流只挂 `workflow_dispatch` + 夜间 cron（重型 docker 套件不该随 PR 运行），没有 PR 可评论；若未来增加
 > `pull_request` 触发，可在 `testing/notifier.py` 同模块上加评论发布。
+> D51 起进入「提交纪律工程化」延伸线：提交信息守门（D51）之后，可继续做提交范围的
+> 影响面提示、每日迭代自动生成的 commit 模板等（均由无人值守任务按最合理默认推进）。
 
 ---
 

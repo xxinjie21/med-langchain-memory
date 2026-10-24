@@ -569,7 +569,7 @@ python -m med_langchain_memory.changelog --log-file commits.txt --output notes.m
 
 ## 每日迭代节奏
 
-项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行、D44 分片结果聚合汇总作业、D45 汇总总账与上一轮基线对比、D46 故障转移演练独立分片与超时预算、D47 两套基线合一：分片粒度趋势上收汇总作业、D48 夜间看板：总账渲染为自包含 HTML 发布到 GitHub Pages、D49 状态徽章：夜间集成结论回写 commit status、D50 发布说明：Conventional Commits 渲染替代 GitHub 自动生成）。
+项目按 [ROADMAP.md](./ROADMAP.md) 的分阶段任务表，由每日自动化任务完成「编码 → 单测 → 提交 → 推送 GitHub」闭环，每个迭代点 30–60 分钟可独立提交。当前已完成阶段 0–4（D1–D35），以及阶段 5 的存储补齐与发布工程（D36 MySQL 适配器、D37 真实中间件集成测试、D38 发布流水线、D39 Redis Cluster 真机用例、D40 集群故障转移演练、D41 夜间 CI 与趋势上报、D42 MySQL 真机用例入 CI 与前置守卫、D43 集成套件按服务分片并行、D44 分片结果聚合汇总作业、D45 汇总总账与上一轮基线对比、D46 故障转移演练独立分片与超时预算、D47 两套基线合一：分片粒度趋势上收汇总作业、D48 夜间看板：总账渲染为自包含 HTML 发布到 GitHub Pages、D49 状态徽章：夜间集成结论回写 commit status、D50 发布说明：Conventional Commits 渲染替代 GitHub 自动生成、D51 提交信息守门：pre-commit commit-msg 钩子 + ci.yml PR 作业按同一套 Conventional Commits 字段级规则拦截不合规提交）。
 
 ---
 

@@ -13,7 +13,9 @@
 :mod:`med_langchain_memory.testing.dashboard`（把同一份总账渲染成自包含 HTML
 看板页，由工作流发布到 GitHub Pages）与
 :mod:`med_langchain_memory.testing.notifier`（把同一份总账的结论回写成 GitHub
-commit status，并给出 README 徽章片段）。
+commit status，并给出 README 徽章片段）与
+:mod:`med_langchain_memory.testing.commitlint`（Conventional Commits 提交信息守门：
+pre-commit commit-msg 钩子与 ci.yml PR 作业共用同一套字段级规则）。
 """
 
 from __future__ import annotations
@@ -66,6 +68,23 @@ from .cluster import (
 # 注意：preflight 的 CLI 入口（build_parser / main）**不**在此导出——
 # 包根上的这两个名字已经属于 trend 的 CLI，导出会造成静默覆盖。
 # 守卫的入口按模块路径调用：``python -m med_langchain_memory.testing.preflight``。
+# 注意：commitlint 的 CLI 入口（build_parser / main）同样**不**在此导出——
+# 包根这两个名字属于 trend 的 CLI。守门入口按模块路径调用：
+# ``python -m med_langchain_memory.testing.commitlint``。
+from .commitlint import (
+    ALLOWED_SCOPES,
+    ALLOWED_TYPES,
+    EXIT_VIOLATIONS,
+    GIT_LOG_FORMAT,
+    MAX_SUBJECT_LENGTH,
+    LintFinding,
+    LintReport,
+    iter_commit_messages,
+    lint_commits,
+    lint_message,
+    parse_git_log_messages,
+    render_report,
+)
 from .dashboard import (
     DASHBOARD_INDEX_NAME,
     DASHBOARD_TITLE,
@@ -165,6 +184,8 @@ from .trend import (
 __all__ = [
     "AGGREGATE_SUMMARY_NAME",
     "ALL_SHARDS",
+    "ALLOWED_SCOPES",
+    "ALLOWED_TYPES",
     "ARTIFACT_PREFIX",
     "BASELINE_LEDGER_DIR",
     "BASELINE_REPORT_NAME",
@@ -194,8 +215,10 @@ __all__ = [
     "EXIT_POST_FAILED",
     "EXIT_POSTED",
     "EXIT_USAGE",
+    "EXIT_VIOLATIONS",
     "FAILOVER_WAIT_SECONDS",
     "FORMATS",
+    "GIT_LOG_FORMAT",
     "INTEGRATION_TEST_DIR",
     "INTEGRATION_WORKFLOW_FILE",
     "JUNIT_REPORT_NAME",
@@ -203,6 +226,7 @@ __all__ = [
     "MATRIX_SHARD_KEY",
     "MATRIX_TIMEOUT_KEY",
     "MAX_DESCRIPTION_LENGTH",
+    "MAX_SUBJECT_LENGTH",
     "RECOVERY_WAIT_SECONDS",
     "REDIS_CLUSTER_NODE_PORTS",
     "SHARDS",
@@ -215,6 +239,8 @@ __all__ = [
     "DockerContainerController",
     "FailoverPlan",
     "IntegrationService",
+    "LintFinding",
+    "LintReport",
     "PreflightReport",
     "ServiceStatus",
     "Shard",
@@ -240,8 +266,12 @@ __all__ = [
     "detect_host_address",
     "find_by_node_id",
     "integration_enabled",
+    "iter_commit_messages",
+    "lint_commits",
+    "lint_message",
     "main",
     "parse_cluster_nodes",
+    "parse_git_log_messages",
     "parse_junit_report",
     "parse_junit_xml",
     "parse_required",
@@ -257,6 +287,7 @@ __all__ = [
     "render_markdown",
     "render_matrix",
     "render_paths",
+    "render_report",
     "render_required",
     "render_table",
     "required_services",

@@ -35,6 +35,27 @@ jobs:
       - name: Mypy type check
         run: mypy
 
+  commit-lint:
+    name: Commit Message Lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package without dependencies
+        run: pip install -e . --no-deps
+
+      - name: Lint pull request commit messages
+        run: python -m med_langchain_memory.testing.commitlint "origin/${{ github.base_ref }}..HEAD"
+
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest

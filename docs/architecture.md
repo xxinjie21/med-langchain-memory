@@ -625,6 +625,37 @@ commit status 把结论推到提交维度：仓库首页徽章常亮，任何点
 
 ---
 
+### ADR-23 · 提交规范用「字段级规则守门」保证，而不是依赖 Review 自觉
+
+**决策**：新增 `med_langchain_memory/testing/commitlint.py`（纯标准库）：
+按 Conventional Commits 规范校验提交信息的**字段级规则**——主题行匹配
+`type(scope)!: description`、type 在白名单内、scope 在白名单内、描述无尾随
+空白/句点、主题行 ≤ 72 字符、正文以空行分隔；git 注释行（`#` 开头）在解析
+前剥掉（pre-commit 传入的 `COMMIT_EDITMSG` 天然带注释）。入口有三处：
+pre-commit 的 `commit-msg` 钩子（本地提交时拦截）、`ci.yml` 的 `commit-lint`
+作业（仅 `pull_request`，范围 `origin/${{ github.base_ref }}..HEAD`，因此不重
+lint 已落地历史）、以及手工 `python -m ...commitlint --message/--message-file`。
+
+| 关注点 | 实现 | 为什么这样切 |
+|---|---|---|
+| 与 D50 的关系 | D50 的 `changelog.py` **消费** Conventional Commits，D51 的 `commitlint.py` **生产**纪律：输入格式坏了发布说明就缺章节，守门是同一规范的入口端 | 单一规范两处落实，正则与白名单同源（`ALLOWED_TYPES` 与 `TYPE_TITLES` 的键一致） |
+| 白名单而非任意字符串 | type/scope 都收敛到固定集合（与本仓库历史实际使用过的范围一致） | 任意 scope 会让分组章节失控；集合随仓库演进，改常量有单测盯着 |
+| 只拦增量 | CI 作业挂 `if: github.event_name == 'pull_request'` + 范围 `origin/<base>..HEAD` | 历史 88 条提交里有 22 条不合规（`Initial commit`、`style` type、超长主题）——守门的目的是新提交可解析，不是改写历史 |
+| 纯标准库 | argparse / re / subprocess / dataclasses；git 调用集中在 `iter_commit_messages`，单测用替身覆盖 | 与 `testing/` 其余 CI 工具同一纪律：零第三方依赖、全程离线可测 |
+| 退出码 | `0` 合规 / `1` 有违规 / `2` 用法或 git 错误；违规明细逐条打印（`FAIL <sha> <subject>` + 缩进规则码） | PR 检查里一眼看到哪条提交、坏在哪条规则，不用翻日志 |
+
+**理由**：本仓库「一天一迭代、commit 即单元」的工作流把发布说明（D50）、
+趋势基线（D41/D45）全建立在提交信息可解析之上；此前只靠 ROADMAP 的文字
+规范与人工自觉，没有机器强制。一层正则 + 两个白名单把纪律前移到提交时刻，
+成本低于任何语义级 commit lint 工具，且不引入第三方依赖。
+
+**代价**：白名单之外的合法 Conventional Commits（如自定义 scope）会被拒，
+需要提 PR 扩 `ALLOWED_SCOPES`（有单测与文档标注集合来源）；对历史提交
+不做任何补救。规则目前只覆盖主题行与正文分隔，未校验正文换行宽度等
+风格项——按需再扩，每条规则都必须带正反用例。
+
+---
+
 ## 5. 并发与可用性
 
 | 机制 | 实现 | 降级路径 |
@@ -685,6 +716,7 @@ commit status 把结论推到提交维度：仓库首页徽章常亮，任何点
 | 夜间看板 | `testing/dashboard.py` 把同一份总账渲染成自包含 HTML（内联 CSS、零外部资源、零 JS、全量转义）并由 `dashboard` 作业发布到 GitHub Pages（ADR-20）；数据来自 `aggregate` 作业在聚合前上传的 `integration-ledger` artifact（顺序由静态测试钉死）；看板不持门禁状态，`contents: write` 只授予该作业；离线单测在 `tests/test_integration/test_dashboard.py`，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestDashboardJob` |
 | 状态徽章 | `testing/notifier.py`（纯标准库，可注入 opener 的 HTTP 替身）把同一份总账的结论回写成 commit status（context: `integration/nightly`，状态口径与聚合 CLI 的 `verdict_exit_code` 同源）；步骤 `continue-on-error`、`statuses: write` 只授予 `aggregate` 作业；离线单测在 `tests/test_integration/test_notifier.py`，工作流契约在 `tests/test_ci/test_integration_workflow.py::TestStatusNotification` |
 | 发布说明 | `changelog.py`（纯标准库，与 `release.py` 同级的发布工程工具）解析 git log 里的 Conventional Commits，按 type 分组渲染 Markdown（Breaking Changes 置顶），`release.yml` 以 `--notes-file` 替代 `--generate-notes`；范围为上一个 tag..HEAD（`git describe` 推断，首轮回退全历史）；离线单测在 `tests/test_changelog.py`，工作流契约在 `tests/test_ci/test_release_workflow.py::TestReleaseNotes`（ADR-22） |
+| 提交守门 | `testing/commitlint.py`（纯标准库）按同一套 Conventional Commits 规范做字段级规则校验（主题行 type/scope/描述、正文分隔、72 字符上限），pre-commit 的 `commit-msg` 钩子在本地拦、`ci.yml` 的 `commit-lint` 作业（仅 `pull_request`，范围 `origin/<base>..HEAD`）在 PR 上拦；退出码 `0/1/2` = 合规 / 违规 / 用法或 git 错误；离线单测在 `tests/test_integration/test_commitlint.py`，工作流契约在 `tests/test_ci/test_workflow.py::TestCommitLintJob`（ADR-23） |
 | 覆盖率门禁 | CI `--cov-fail-under=85`，实际维持在 99% |
 | 发布门禁 | `med_langchain_memory/release.py`（纯标准库）校验 tag ↔ pyproject ↔ `__version__` 与 sdist/wheel 完整性；`tests/test_ci/test_release_workflow.py` 静态校验 `release.yml`（触发条件、作业顺序、最小权限、动作锁版本、CLI 选项真实存在） |
 | 文档一致性 | `tests/test_docs/` 校验文档字段 / 端点 / 后端清单与代码、proto、pyproject 保持同步 |
